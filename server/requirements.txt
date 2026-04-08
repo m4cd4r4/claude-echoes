@@ -1,0 +1,5 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+asyncpg==0.30.0
+aiohttp==3.11.11
+pydantic==2.10.3

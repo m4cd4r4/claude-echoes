@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: echoes-postgres
+    environment:
+      POSTGRES_USER: echoes
+      POSTGRES_PASSWORD: echoes
+      POSTGRES_DB: echoes
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./sql:/sql:ro
+    ports:
+      - "127.0.0.1:5434:5432"     # local only, different port to avoid collisions
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U echoes -d echoes"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: echoes-ollama
+    volumes:
+      - ./data/ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11435:11434"    # local only, different port to avoid collisions
+    restart: unless-stopped
+
+  server:
+    build: ./server
+    container_name: echoes-server
+    environment:
+      ECHOES_DB_DSN: postgresql://echoes:echoes@postgres:5432/echoes
+      ECHOES_OLLAMA_URL: http://ollama:11434
+      ECHOES_OLLAMA_MODEL: nomic-embed-text
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8088:8088"
+    restart: unless-stopped
