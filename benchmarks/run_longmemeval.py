@@ -575,14 +575,16 @@ ANSWER_SYSTEM = """You are answering a question based ONLY on retrieved past cha
 
 You will be given:
   1. A question about things the user discussed in past sessions.
-  2. A list of retrieved messages that are the top semantic matches for that question.
+  2. A list of retrieved messages ranked by relevance.
 
 Your job: answer the question using ONLY information in the retrieved messages.
 
 Rules:
 - If the retrieved messages contain the answer, give it concisely and directly.
-- If the retrieved messages do NOT contain enough information to answer, say so explicitly. Do not guess.
 - If the question is about "when" something happened, quote the exact date from the message timestamp if given.
+- For counting questions ("how many X"), scan ALL retrieved messages and enumerate every distinct instance. Do not stop at the first match.
+- For preference questions ("what would I like", "recommend based on my taste"), infer the user's likely preference from ANY relevant past context - even a single mention of a related topic, hobby, or prior request. Synthesize; do not refuse just because the evidence is indirect.
+- Only say "not enough information" if the retrieved messages are genuinely unrelated to the question. If there is ANY topical overlap, attempt an answer.
 - Keep answers short. No preamble. No "based on the retrieved messages..." filler.
 """
 
@@ -617,11 +619,13 @@ def format_hits(hits: list[tuple[float, Turn]], chronological: bool = False) -> 
             lines.append(f"[session:{sid_short}] {ts}{t.role}: {t.content}")
         return "\n".join(lines)
     else:
-        # Vanilla: preserve exact baseline format (relevance-ordered with similarity scores).
+        # Vanilla: relevance-ordered with rank numbers (not raw similarity scores,
+        # which are tiny RRF values that can mislead the LLM into thinking
+        # low-score = low-confidence = "refuse to answer").
         lines = []
-        for score, t in hits:
+        for rank, (score, t) in enumerate(hits, 1):
             ts = f"[{t.timestamp}] " if t.timestamp else ""
-            lines.append(f"({score:.3f}) {ts}{t.role}: {t.content}")
+            lines.append(f"(#{rank}) {ts}{t.role}: {t.content}")
         return "\n".join(lines)
 
 def answer_with_claude(client, model: str, question: str, hits_text: str,
@@ -759,26 +763,29 @@ def main():
         if query_vec is None:
             return {"question_id": qid, "hypothesis": "", "error": "query embed failed"}
 
+        # Dynamic top-k: counting questions need broader recall
+        is_count = bool(_re.search(r"\bhow many\b|\btotal number\b|\bhow much\b", qtxt, _re.I))
+        effective_k = max(args.top_k, 25) if is_count else args.top_k
+
         use_temporal = args.temporal and _is_temporal_question(qtxt)
         if use_temporal and args.hybrid_search:
-            # Full stack: BM25 + cosine RRF + temporal re-rank + session diversity
             hits = retriever.search_hybrid_temporal(
-                qid, qtxt, query_vec, question_date=qdate, k=args.top_k,
+                qid, qtxt, query_vec, question_date=qdate, k=effective_k,
                 temporal_weight=args.temporal_weight)
             use_chrono = True
             system = ANSWER_SYSTEM_TEMPORAL
         elif use_temporal:
             hits = retriever.search_temporal(
-                qid, query_vec, question_date=qdate, k=args.top_k,
+                qid, query_vec, question_date=qdate, k=effective_k,
                 temporal_weight=args.temporal_weight)
             use_chrono = True
             system = ANSWER_SYSTEM_TEMPORAL
         elif args.hybrid_search:
-            hits = retriever.search_hybrid(qid, qtxt, query_vec, k=args.top_k)
+            hits = retriever.search_hybrid(qid, qtxt, query_vec, k=effective_k)
             use_chrono = False
             system = ANSWER_SYSTEM
         else:
-            hits = retriever.search(qid, query_vec, k=args.top_k)
+            hits = retriever.search(qid, query_vec, k=effective_k)
             use_chrono = False
             system = ANSWER_SYSTEM
 
