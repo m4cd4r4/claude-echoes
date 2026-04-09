@@ -6,6 +6,8 @@ Every prompt, every response, every project — searchable by meaning, across ev
 > *"I ran three sessions yesterday on the same project. Which one fixed the bug?"*
 > Echoes answers that question in 200ms, in plain English, from your verbatim history.
 
+**Benchmarked honestly.** 71.6% on [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (ICLR 2025) with Sonnet 4.6, 61.6% with Haiku 4.5, on the same boring pgvector pipeline you see below. Full per-category breakdown, raw outputs, and reproduction steps in [benchmarks/](benchmarks/). No hardcoded answer patterns. No invented terminology. No cherry-picking.
+
 ---
 
 ## What it does
@@ -41,7 +43,8 @@ Honest comparison:
 | Install time | ~10 min (one docker-compose) | ~30 min | Varies |
 | Designed for Claude Code specifically | Yes | No | No |
 | Summarises / extracts "important" bits | **No — verbatim only** | No | Yes |
-| Lines of code | ~800 | ~3000+ | Large |
+| LongMemEval_S score | **71.6%** (Sonnet) / **61.6%** (Haiku) — [reproducible](benchmarks/) | [96.6% claimed](https://x.com/banteg/status/2041427374487605614) (disputed) | Not reported |
+| Lines of code | ~800 + ~600 benchmark | ~3000+ | Large |
 
 If you already run a Postgres and don't use Claude Code, MemPalace is probably better for you. If you live in Claude Code all day and keep losing context between sessions, this is built for you.
 
