@@ -1,5 +1,9 @@
 # claude-echoes
 
+<p align="center">
+  <img src="assets/hero.png" alt="claude-echoes terminal showing /recall query with search results" width="700">
+</p>
+
 **Verbatim semantic memory for Claude Code sessions.**
 Every prompt, every response, every project — searchable by meaning, across every session you've ever run. Self-hosted. Free. ~10 minutes to install.
 
