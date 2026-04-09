@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re as _re
 import sys
 import time
 import urllib.request
@@ -191,13 +192,27 @@ class Turn:
     content:     str
     timestamp:   Optional[str]
 
+def _tokenize(text: str) -> list[str]:
+    """
+    Simple tokenizer for BM25: lowercase, split on non-alphanumeric,
+    drop very short and very long tokens. No stemming — keeps it auditable.
+    """
+    text = (text or "").lower()
+    toks = _re.findall(r"[a-z0-9]+", text)
+    return [t for t in toks if 2 <= len(t) <= 30]
+
+
 class EchoesRetriever:
     """
     Per-question retrieval.
 
-    This is the same math as `ORDER BY embedding <=> $1::vector` in Postgres:
-    cosine distance, lower is better. We normalize once so we can compute
-    distances as a dot product.
+    Two indices, both per-question-id for O(1) filtering:
+      - cosine: normalized 768-d nomic embeddings, dot product
+      - bm25:   classic bag-of-words lexical index (built lazily)
+
+    The cosine index matches the live server (`ORDER BY embedding <=> $1::vector`).
+    BM25 is only used when hybrid search is explicitly enabled, for benchmarking
+    experiments. The production server is cosine-only for simplicity.
     """
     def __init__(self, turns: list[Turn], embeddings: np.ndarray):
         assert len(turns) == embeddings.shape[0], \
@@ -213,6 +228,170 @@ class EchoesRetriever:
             self.by_qid.setdefault(t.question_id, []).append(i)
         for qid in self.by_qid:
             self.by_qid[qid] = np.array(self.by_qid[qid], dtype=np.int64)
+        # Lazy BM25 cache, keyed by qid. Only built on first hybrid query for that qid.
+        self._bm25_cache: dict[str, tuple] = {}
+
+    def _get_bm25(self, qid: str):
+        """Build and cache a BM25 index for a single question's haystack."""
+        if qid in self._bm25_cache:
+            return self._bm25_cache[qid]
+        from rank_bm25 import BM25Okapi
+        idxs = self.by_qid[qid]
+        corpus_toks = [_tokenize(self.turns[int(i)].content) for i in idxs]
+        bm25 = BM25Okapi(corpus_toks)
+        self._bm25_cache[qid] = (bm25, corpus_toks)
+        return self._bm25_cache[qid]
+
+    def search_hybrid(self, qid: str, query_text: str, query_vec: np.ndarray,
+                      k: int = TOP_K, wide_k: int = 30,
+                      rrf_k: int = 60) -> list[tuple[float, Turn]]:
+        """
+        Hybrid retrieval using Reciprocal Rank Fusion (RRF) of:
+          1. cosine similarity on nomic embeddings (semantic)
+          2. BM25 lexical scores (keyword/rare-term match)
+
+        RRF formula: score(doc) = sum over rankers of 1 / (rrf_k + rank)
+        where rank is 1-indexed. rrf_k=60 is the standard value from
+        the Cormack et al. 2009 RRF paper.
+
+        Both rankers contribute their top-`wide_k` candidates. The union
+        is scored with RRF and the final top-k is returned.
+        """
+        idxs = self.by_qid.get(qid)
+        if idxs is None or idxs.size == 0:
+            return []
+
+        # --- Rank 1: cosine similarity ---
+        q = query_vec / max(np.linalg.norm(query_vec), 1e-9)
+        sims = self.emb[idxs] @ q
+        wk = min(wide_k, sims.size)
+        cos_top = np.argpartition(-sims, wk - 1)[:wk]
+        cos_top = cos_top[np.argsort(-sims[cos_top])]   # sorted best-first
+        cos_ranks = {int(local_idx): rank + 1 for rank, local_idx in enumerate(cos_top)}
+
+        # --- Rank 2: BM25 ---
+        bm25, _ = self._get_bm25(qid)
+        query_toks = _tokenize(query_text)
+        if query_toks:
+            bm25_scores = bm25.get_scores(query_toks)
+            bm25_top = np.argpartition(-bm25_scores, wk - 1)[:wk]
+            bm25_top = bm25_top[np.argsort(-bm25_scores[bm25_top])]
+            bm25_ranks = {int(local_idx): rank + 1 for rank, local_idx in enumerate(bm25_top)}
+        else:
+            bm25_ranks = {}
+
+        # --- RRF fusion ---
+        all_candidates = set(cos_ranks) | set(bm25_ranks)
+        fused: list[tuple[float, int]] = []
+        for local_idx in all_candidates:
+            score = 0.0
+            if local_idx in cos_ranks:
+                score += 1.0 / (rrf_k + cos_ranks[local_idx])
+            if local_idx in bm25_ranks:
+                score += 1.0 / (rrf_k + bm25_ranks[local_idx])
+            fused.append((score, local_idx))
+        fused.sort(key=lambda x: -x[0])
+
+        # Return top-k as (score, Turn) tuples
+        out = []
+        for score, local_idx in fused[:k]:
+            out.append((float(score), self.turns[int(idxs[local_idx])]))
+        return out
+
+    def search_hybrid_temporal(self, qid: str, query_text: str,
+                               query_vec: np.ndarray, question_date: str,
+                               k: int = TOP_K, wide_k: int = 50,
+                               rrf_k: int = 60,
+                               temporal_weight: float = 0.15) -> list[tuple[float, Turn]]:
+        """
+        Hybrid RRF + temporal re-ranking + session diversity.
+        Combines the strengths of both approaches:
+          - BM25 catches rare-term queries (preference category)
+          - Cosine catches semantic paraphrase
+          - Temporal weight biases toward recency
+          - Session diversity enables cross-session reasoning
+        """
+        idxs = self.by_qid.get(qid)
+        if idxs is None or idxs.size == 0:
+            return []
+
+        # Get wide_k candidates from each ranker
+        q = query_vec / max(np.linalg.norm(query_vec), 1e-9)
+        sims = self.emb[idxs] @ q
+        wk = min(wide_k, sims.size)
+        cos_top = np.argpartition(-sims, wk - 1)[:wk]
+        cos_top = cos_top[np.argsort(-sims[cos_top])]
+        cos_ranks = {int(i): rank + 1 for rank, i in enumerate(cos_top)}
+
+        bm25, _ = self._get_bm25(qid)
+        query_toks = _tokenize(query_text)
+        if query_toks:
+            bm25_scores = bm25.get_scores(query_toks)
+            bm25_top = np.argpartition(-bm25_scores, wk - 1)[:wk]
+            bm25_top = bm25_top[np.argsort(-bm25_scores[bm25_top])]
+            bm25_ranks = {int(i): rank + 1 for rank, i in enumerate(bm25_top)}
+        else:
+            bm25_ranks = {}
+
+        # RRF fusion
+        all_candidates = list(set(cos_ranks) | set(bm25_ranks))
+        rrf_scores = np.zeros(len(all_candidates), dtype=np.float32)
+        for j, local_idx in enumerate(all_candidates):
+            if local_idx in cos_ranks:
+                rrf_scores[j] += 1.0 / (rrf_k + cos_ranks[local_idx])
+            if local_idx in bm25_ranks:
+                rrf_scores[j] += 1.0 / (rrf_k + bm25_ranks[local_idx])
+
+        # Temporal scoring on the fused candidates
+        q_ts = _parse_date(question_date)
+        t_scores = np.zeros(len(all_candidates), dtype=np.float32)
+        for j, local_idx in enumerate(all_candidates):
+            turn = self.turns[int(idxs[local_idx])]
+            t_ts = _parse_date(turn.timestamp)
+            if q_ts is not None and t_ts is not None:
+                delta = max((q_ts - t_ts).days, 0)
+                t_scores[j] = max(1.0 - delta / 365.0, 0.0)
+
+        # Normalize RRF to [0, 1]
+        rrf_min, rrf_max = rrf_scores.min(), rrf_scores.max()
+        if rrf_max > rrf_min:
+            rrf_norm = (rrf_scores - rrf_min) / (rrf_max - rrf_min)
+        else:
+            rrf_norm = np.ones_like(rrf_scores)
+
+        blended = (1.0 - temporal_weight) * rrf_norm + temporal_weight * t_scores
+
+        # Session diversity pass
+        sorted_order = np.argsort(-blended)
+        selected: list[int] = []
+        seen_sessions: dict[str, int] = {}
+        for order_idx in sorted_order:
+            local_idx = all_candidates[order_idx]
+            turn = self.turns[int(idxs[local_idx])]
+            selected.append(int(order_idx))
+            seen_sessions[turn.session_id] = seen_sessions.get(turn.session_id, 0) + 1
+            if len(selected) >= k:
+                break
+
+        if len(seen_sessions) < 3 and len(sorted_order) > k:
+            for order_idx in sorted_order[k:]:
+                local_idx = all_candidates[int(order_idx)]
+                turn = self.turns[int(idxs[local_idx])]
+                if turn.session_id not in seen_sessions:
+                    for r in reversed(selected):
+                        rturn = self.turns[int(idxs[all_candidates[r]])]
+                        if seen_sessions.get(rturn.session_id, 0) > 1:
+                            seen_sessions[rturn.session_id] -= 1
+                            selected.remove(r)
+                            selected.append(int(order_idx))
+                            seen_sessions[turn.session_id] = 1
+                            break
+                    if len(seen_sessions) >= 3:
+                        break
+
+        return [(float(blended[i]),
+                 self.turns[int(idxs[all_candidates[i]])])
+                for i in selected[:k]]
 
     def search(self, qid: str, query_vec: np.ndarray, k: int = TOP_K) -> list[tuple[float, Turn]]:
         idxs = self.by_qid.get(qid)
@@ -310,8 +489,6 @@ class EchoesRetriever:
                    for i in selected[:k]]
         return results
 
-
-import re as _re
 
 # Temporal-intent keywords: if any of these patterns appear in a question,
 # use temporal-aware retrieval. Deliberately conservative — false negatives
@@ -495,6 +672,8 @@ def main():
                     help="enable temporal-aware retrieval + chronological prompting")
     ap.add_argument("--temporal-weight", type=float, default=0.15,
                     help="blend weight for temporal score (0=pure semantic, 1=pure temporal)")
+    ap.add_argument("--hybrid-search", action="store_true",
+                    help="enable BM25 + cosine RRF hybrid retrieval")
     args = ap.parse_args()
 
     full_dataset = load_dataset(args.dataset)
@@ -581,12 +760,23 @@ def main():
             return {"question_id": qid, "hypothesis": "", "error": "query embed failed"}
 
         use_temporal = args.temporal and _is_temporal_question(qtxt)
-        if use_temporal:
+        if use_temporal and args.hybrid_search:
+            # Full stack: BM25 + cosine RRF + temporal re-rank + session diversity
+            hits = retriever.search_hybrid_temporal(
+                qid, qtxt, query_vec, question_date=qdate, k=args.top_k,
+                temporal_weight=args.temporal_weight)
+            use_chrono = True
+            system = ANSWER_SYSTEM_TEMPORAL
+        elif use_temporal:
             hits = retriever.search_temporal(
                 qid, query_vec, question_date=qdate, k=args.top_k,
                 temporal_weight=args.temporal_weight)
             use_chrono = True
             system = ANSWER_SYSTEM_TEMPORAL
+        elif args.hybrid_search:
+            hits = retriever.search_hybrid(qid, qtxt, query_vec, k=args.top_k)
+            use_chrono = False
+            system = ANSWER_SYSTEM
         else:
             hits = retriever.search(qid, query_vec, k=args.top_k)
             use_chrono = False

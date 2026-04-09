@@ -2,7 +2,7 @@
 
 claude-echoes is a retrieval system. Its job is to find the right past message when you ask a question in natural language. This directory contains an honest end-to-end evaluation of that capability on a public, peer-reviewed benchmark.
 
-> **tl;dr** — **71.6% on LongMemEval_S** using **Sonnet 4.6** + vanilla pgvector + hybrid temporal-aware retrieval. **61.6% with Haiku 4.5** (roughly 1/10th the cost). Code, raw outputs, and evaluation script are all in this directory. If you think these numbers are wrong, run them yourself in ~15 minutes.
+> **tl;dr** — **76.4% on LongMemEval_S** using **Sonnet 4.6** + pgvector + BM25 hybrid retrieval + temporal-aware re-ranking. **64.4% with Haiku 4.5** (roughly 1/10th the cost). Code, raw outputs, and evaluation script are all in this directory. If you think these numbers are wrong, run them yourself in ~15 minutes.
 
 ## What we ran
 
@@ -16,48 +16,54 @@ claude-echoes is a retrieval system. Its job is to find the right past message w
 
 ## Results
 
-### Haiku 4.5 ladder (the headline)
+### Full results table
 
-| Category | Baseline | Temporal (all) | Hybrid (detected) | **Hybrid-v2** |
-|---|---|---|---|---|
-| single-session-assistant | 92.9% | 83.9% | 83.9% | **89.3%** |
-| single-session-user | 84.3% | 88.6% | 85.7% | **87.1%** |
-| knowledge-update | 78.2% | 78.2% | 80.8% | **80.8%** |
-| multi-session | 47.4% | 49.6% | 51.9% | **51.1%** |
-| temporal-reasoning | 36.1% | 43.6% | 42.9% | **42.1%** |
-| single-session-preference | 33.3% | 26.7% | 33.3% | **33.3%** |
-| **OVERALL** | **58.6%** | **60.4%** | **61.2%** | **61.6%** |
+| Category | Haiku base | Haiku +temp | Haiku +BM25 | **Haiku +BM25 +temp** | Sonnet +temp | Sonnet +BM25 | **Sonnet +BM25 +temp** |
+|---|---|---|---|---|---|---|---|
+| single-session-user | 84.3% | 87.1% | 92.9% | **94.3%** | 92.9% | 98.6% | **98.6%** |
+| single-session-assistant | 92.9% | 89.3% | 87.5% | **89.3%** | 96.4% | 92.9% | **94.6%** |
+| knowledge-update | 78.2% | 80.8% | 78.2% | **79.5%** | 85.9% | 82.1% | **84.6%** |
+| multi-session | 47.4% | 51.1% | 48.1% | **49.6%** | 61.7% | 61.7% | **63.2%** |
+| temporal-reasoning | 36.1% | 42.1% | 47.4% | **51.1%** | 55.6% | 71.4% | **69.9%** |
+| single-session-preference | 33.3% | 33.3% | 26.7% | **33.3%** | 53.3% | 56.7% | **56.7%** |
+| **OVERALL** | **58.6%** | **61.6%** | **62.0%** | **64.4%** | **71.6%** | **75.8%** | **76.4%** |
 
-**Haiku 4.5 baseline (58.6%)** — pure cosine similarity over 768-dim nomic embeddings. Top-10 hits passed to Haiku as a flat list, ranked by relevance. This is what you get with no temporal reasoning at all — exactly what a naive pgvector setup produces.
+### What each stage does
 
-**Temporal mode (60.4%)** — widens retrieval to top-50, re-ranks with 15% temporal weight (recency bias), enforces 3-session diversity, presents hits chronologically, uses a temporal-aware system prompt. Helps temporal-reasoning (+7.5) but hurts single-session-preference (-6.7) and single-session-assistant (-9.0) because chronological ordering confuses questions where time isn't relevant.
+**Haiku baseline (58.6%)** — pure cosine similarity over 768-d nomic embeddings. Top-10 hits passed to Haiku as a flat list ranked by similarity. This is what you get from a naive pgvector setup with no tuning.
 
-**Hybrid v1 (61.2%)** — use temporal mode only when the question matches keyword patterns like "how many days between", "when did", "how long ago". Preserves preference category but still regresses on assistant questions due to shared formatting changes.
+**+ temporal hybrid (61.6% Haiku / 71.6% Sonnet)** — widens retrieval to top-50, re-ranks with 15% temporal weight (recency bias), enforces 3-session diversity, presents hits chronologically. Only activates when the question matches a temporal-intent keyword pattern ("how many days between", "when did", "how long ago" etc.) — conservative detector with ~51% recall, 5% false positive rate. Preserves performance on non-temporal questions.
 
-**Hybrid v2 (61.6%)** — same as v1, but vanilla-mode questions use exactly the baseline formatting. Best result: +3.0 points over baseline with almost no regressions.
+**+ BM25 hybrid search (62.0% Haiku / 75.8% Sonnet)** — adds a BM25 lexical index alongside the cosine index. Each question retrieves top-30 from both rankers, then we merge with Reciprocal Rank Fusion (RRF, `k=60`, from Cormack et al. 2009). BM25 catches questions where the answer hinges on rare terms or exact phrases that cosine similarity glosses over.
 
-### Sonnet 4.6 on the same hybrid pipeline
+**+ both (64.4% Haiku / 76.4% Sonnet)** — full stack. Hybrid RRF retrieval, then temporal re-ranking + session diversity on the fused candidates, temporal system prompt for detected temporal questions. This is the headline configuration.
 
-Same retrieval code, same temporal-hybrid logic, same evaluation. Only the answering model changed.
+### Where the gains came from
 
-| Category | Haiku base | Haiku hybrid | **Sonnet hybrid** |
+**BM25 delivered the biggest single improvement — and not where we expected.** We added it to help `single-session-preference` (scattered rare-term content) but its biggest impact was on `temporal-reasoning`: **+15.8 points on Sonnet** (55.6% → 71.4%). Why? Temporal questions contain specific entities ("the Nordstrom sale", "my new keyboard", "the crystal chandelier") that cosine glossed over with semantic neighbors, but BM25 nails exactly. The lexical signal turned out to matter more than the temporal recency bias.
+
+**Single-session-user hit 98.6% on Sonnet+BM25.** That's 69/70 questions. The one remaining failure is a borderline judge call, not a retrieval miss. This category is essentially solved.
+
+**Multi-session is still the hard ceiling at 63.2%.** BM25 only helped +1.5 here; the remaining gap is genuine cross-session reasoning that neither retrieval nor single-pass LLM can easily bridge. A second-stage LLM re-ranker or structured session summarization would be the next lever.
+
+**Preference improvements were modest.** Sonnet went 53.3% → 56.7% with BM25, Haiku stayed flat. Preferences aren't primarily a vocabulary problem; they're an aggregation problem across many weak signals. This needs a different approach (probably clustering or explicit preference extraction).
+
+### Cost / quality pareto frontier
+
+| Config | Score | Approx cost per 500 queries | Notes |
 |---|---|---|---|
-| single-session-assistant | 92.9% | 89.3% | **96.4%** |
-| single-session-user | 84.3% | 87.1% | **92.9%** |
-| knowledge-update | 78.2% | 80.8% | **85.9%** |
-| multi-session | 47.4% | 51.1% | **61.7%** |
-| temporal-reasoning | 36.1% | 42.1% | **55.6%** |
-| single-session-preference | 33.3% | 33.3% | **53.3%** |
-| **OVERALL** | **58.6%** | **61.6%** | **71.6%** |
+| Haiku baseline | 58.6% | ~$2 | Vanilla pgvector, no tuning |
+| Haiku + BM25 + temporal | **64.4%** | ~$3 | **Best Haiku config** |
+| Sonnet + temporal | 71.6% | ~$25 | Previous best pre-BM25 |
+| Sonnet + BM25 + temporal | **76.4%** | ~$25 | **Best overall** |
 
-**Sonnet jumps every category, biggest gains on the hard ones:** +20 on preference, +13.5 on temporal-reasoning, +10.6 on multi-session. This tells us two things:
+**The sweet spot depends on use case:**
 
-1. **Retrieval is not the bottleneck for most failures.** When Haiku fails, Sonnet often succeeds on the same top-K hits. The information is there; the reasoning is harder than Haiku can reliably handle.
-2. **The temporal-hybrid logic is model-agnostic.** Both models benefit from it in roughly the same directions. It's not a "Haiku crutch."
+- **"Find that past conversation"** (single-session retrieval): Haiku + BM25 + temporal gets 94.3% user / 89.3% assistant. This is the core claude-echoes use case and Haiku handles it fine at ~$3/1000 queries.
+- **"When did X happen? How long between A and B?"** (temporal reasoning): Sonnet jumps this category from 51% → 70%. Worth the upgrade if this is your workload.
+- **"Synthesize across multiple conversations"** (multi-session): Both models cap at ~63%. This is a genuine retrieval ceiling that neither BM25 nor temporal heuristics break through.
 
-**Cost calibration:** The Sonnet run cost approximately 10x more API spend than the Haiku run (input and output token prices differ). For the baseline use case — "find that past conversation" — Haiku at 61.6% with single-session-user/assistant at 87%/89% is probably the sweet spot. Upgrade to Sonnet when temporal and multi-session reasoning matter.
-
-We have not run Opus on this benchmark. If you do, please PR the result.
+We have not run Opus on this benchmark. The Sonnet→Opus gap on similar long-context benchmarks is typically +3-5 points, and Opus costs ~10x more than Sonnet. At 76.4% with the full stack, we decided diminishing returns made it not worth the ~$150 cost. If you run it, please PR the result.
 
 ## What this means
 
@@ -103,14 +109,23 @@ python run_longmemeval.py \
   --top-k 10 \
   --out results/haiku_baseline.jsonl
 
-# 5. Retrieve + answer with hybrid temporal mode (~2.5 min, ~$3)
+# 5. Best Haiku config: BM25 hybrid search + temporal (~3 min, ~$3)
 python run_longmemeval.py \
   --dataset data/longmemeval_s_cleaned.json \
   --embeddings cache/s_embeddings.npz \
   --answer-model claude-haiku-4-5-20251001 \
   --top-k 15 \
-  --temporal \
-  --out results/haiku_hybrid.jsonl
+  --hybrid-search --temporal \
+  --out results/haiku_bm25_temporal.jsonl
+
+# 5b. Best overall: Sonnet + BM25 + temporal (~3 min, ~$25)
+python run_longmemeval.py \
+  --dataset data/longmemeval_s_cleaned.json \
+  --embeddings cache/s_embeddings.npz \
+  --answer-model claude-sonnet-4-6 \
+  --top-k 15 \
+  --hybrid-search --temporal \
+  --out results/sonnet_bm25_temporal.jsonl
 
 # 6. Judge with GPT-4o-mini (~5 min, ~$0.50)
 python official/src/evaluation/evaluate_qa.py \
@@ -138,8 +153,8 @@ LongMemEval is actively reported on by multiple teams in 2026. Here's where clau
 
 | System | LongMemEval_S | Embedding | Approach |
 |---|---|---|---|
-| **claude-echoes** (Sonnet 4.6, hybrid) | **71.6%** | nomic-embed-text (local, free) | pgvector cosine + temporal hybrid |
-| **claude-echoes** (Haiku 4.5, hybrid) | **61.6%** | nomic-embed-text (local, free) | pgvector cosine + temporal hybrid |
+| **claude-echoes** (Sonnet 4.6, BM25+temporal) | **76.4%** | nomic-embed-text (local, free) | pgvector cosine + BM25 RRF + temporal re-rank |
+| **claude-echoes** (Haiku 4.5, BM25+temporal) | **64.4%** | nomic-embed-text (local, free) | pgvector cosine + BM25 RRF + temporal re-rank |
 | Atlas Memory | 90.18% | ? | Re-ranking + summarization pipeline |
 | MemPalace | [96.6% claimed](https://github.com/milla-jovovich/mempalace) | ChromaDB default | ["invented terms for known things... grandiose claims... benchmaxx fraud with hardcoded patterns for answers"](https://x.com/banteg/status/2041427374487605614) |
 
@@ -151,16 +166,15 @@ LongMemEval is actively reported on by multiple teams in 2026. Here's where clau
 
 | File | What it is |
 |---|---|
-| [run_longmemeval.py](run_longmemeval.py) | Single-file pipeline: embed → retrieve → answer. ~600 lines. Read it. |
+| [run_longmemeval.py](run_longmemeval.py) | Single-file pipeline: embed → retrieve (cosine + BM25 + temporal) → answer |
 | [fix_zero_rows.py](fix_zero_rows.py) | Retry embeds that failed during the bulk run (75 out of 246,750) |
 | `data/longmemeval_s_cleaned.json` | Not checked in - download from HuggingFace |
 | `cache/s_embeddings.npz` | Not checked in - 668 MB, regenerate with `--embed-only` |
 | `results/haiku_full.jsonl` | Baseline Haiku raw outputs (500 questions) |
-| `results/haiku_hybrid2.jsonl` | Hybrid-v2 Haiku raw outputs (headline result) |
-| `results/sonnet_hybrid.jsonl` | Hybrid Sonnet raw outputs |
+| `results/haiku_bm25_temporal.jsonl` | Best Haiku config raw outputs (64.4%) |
+| `results/sonnet_bm25_temporal.jsonl` | **Best overall raw outputs (76.4%)** |
 | `results/*.eval-results-gpt-4o-mini` | GPT-4o-mini judge outputs for each run |
-| `logs/*.log` | Full run logs including embed failures |
-| `official/` | Clone of LongMemEval repo (for the judge script) |
+| `official/` | Clone of LongMemEval repo (for the judge script, gitignored) |
 
 ## If you think our numbers are wrong
 
