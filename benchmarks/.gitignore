@@ -1,0 +1,11 @@
+# Large files — regenerate these
+data/*.json
+cache/*.npz
+cache/*.tmp.npz
+
+# Third-party clone
+official/
+
+# Nothing else
+!data/.gitkeep
+!cache/.gitkeep
