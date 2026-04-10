@@ -10,7 +10,7 @@ Every prompt, every response, every project — searchable by meaning, across ev
 > *"I ran three sessions yesterday on the same project. Which one fixed the bug?"*
 > Echoes answers that question in 200ms, in plain English, from your verbatim history.
 
-**Benchmarked honestly.** **81.0% on [LongMemEval](https://github.com/xiaowu0162/LongMemEval)** (ICLR 2025) with Sonnet 4.6 — pgvector cosine + BM25 RRF hybrid + temporal re-ranking. **100% on single-session-user retrieval** (70/70). Full per-category breakdown, raw outputs, and reproduction steps in [benchmarks/](benchmarks/). No hardcoded answer patterns. No invented terminology. No cherry-picking.
+**Benchmarked honestly.** **86.4% on [LongMemEval](https://github.com/xiaowu0162/LongMemEval)** (ICLR 2025) with Sonnet 4.6 - pgvector cosine + BM25 RRF hybrid + temporal re-ranking + LLM re-ranker. **100% on single-session-user retrieval** (70/70). Full per-category breakdown, raw outputs, and reproduction steps in [benchmarks/](benchmarks/). No hardcoded answer patterns. No invented terminology. No cherry-picking.
 
 ---
 
@@ -47,7 +47,7 @@ Honest comparison:
 | Install time | ~10 min (one docker-compose) | ~30 min | Varies |
 | Designed for Claude Code specifically | Yes | No | No |
 | Summarises / extracts "important" bits | **No — verbatim only** | No | Yes |
-| LongMemEval_S score | **81.0%** (Sonnet) / **64.4%** (Haiku) — [reproducible](benchmarks/) | [96.6% claimed](https://x.com/banteg/status/2041427374487605614) (disputed) | Not reported |
+| LongMemEval_S score | **86.4%** (Sonnet) / **76.8%** (Haiku) - [reproducible](benchmarks/) | [96.6% claimed](https://x.com/banteg/status/2041427374487605614) (disputed) | Not reported |
 | Lines of code | ~800 + ~600 benchmark | ~3000+ | Large |
 
 If you already run a Postgres and don't use Claude Code, MemPalace is probably better for you. If you live in Claude Code all day and keep losing context between sessions, this is built for you.

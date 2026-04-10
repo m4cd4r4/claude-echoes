@@ -242,6 +242,67 @@ class EchoesRetriever:
         self._bm25_cache[qid] = (bm25, corpus_toks)
         return self._bm25_cache[qid]
 
+    def rerank_with_llm(self, hits: list[tuple[float, Turn]], question: str,
+                        rerank_client, rerank_model: str = "claude-haiku-4-5-20251001",
+                        k: int = TOP_K) -> list[tuple[float, Turn]]:
+        """
+        LLM re-ranker: takes top-N candidates from any retrieval method,
+        asks a cheap LLM to score each one's relevance to the question,
+        and returns the top-k by LLM score.
+
+        This catches cases where semantically similar but irrelevant content
+        outranks the actual answer in embedding space.
+        """
+        if not hits or len(hits) <= k:
+            return hits
+
+        # Build numbered list of candidates for the LLM
+        candidate_lines = []
+        for i, (score, turn) in enumerate(hits):
+            # Truncate content to keep prompt small
+            content = turn.content[:400].replace("\n", " ")
+            candidate_lines.append(f"[{i}] {turn.role}: {content}")
+        candidates_text = "\n".join(candidate_lines)
+
+        rerank_prompt = f"""Given this question about past conversations:
+"{question}"
+
+Here are {len(hits)} retrieved messages. Score each message's relevance to answering the question on a scale of 0-10. Return ONLY a JSON array of [index, score] pairs, sorted by score descending. No explanation.
+
+Messages:
+{candidates_text}
+
+Return format: [[index, score], [index, score], ...]"""
+
+        try:
+            r = rerank_client.messages.create(
+                model=rerank_model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": rerank_prompt}],
+            )
+            text = r.content[0].text.strip()
+            # Parse the JSON array - handle markdown code blocks
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            scores = json.loads(text)
+            # Build index -> LLM score map
+            llm_scores = {int(pair[0]): float(pair[1]) for pair in scores
+                         if isinstance(pair, (list, tuple)) and len(pair) >= 2}
+            # Re-sort hits by LLM score (descending), fall back to original rank
+            reranked = sorted(
+                enumerate(hits),
+                key=lambda x: llm_scores.get(x[0], 0),
+                reverse=True,
+            )
+            return [(llm_scores.get(i, hits[i][0]), hits[i][1])
+                    for i, _ in reranked[:k]]
+        except Exception as e:
+            print(f"  rerank failed, falling back to original order: {e}",
+                  file=sys.stderr, flush=True)
+            return hits[:k]
+
     def search_hybrid(self, qid: str, query_text: str, query_vec: np.ndarray,
                       k: int = TOP_K, wide_k: int = 30,
                       rrf_k: int = 60) -> list[tuple[float, Turn]]:
@@ -518,6 +579,47 @@ def _is_temporal_question(question: str) -> bool:
     return bool(_TEMPORAL_RE.search(question))
 
 
+def _extract_temporal_context(question: str, question_date: str,
+                              client, model: str = "claude-haiku-4-5-20251001") -> Optional[dict]:
+    """
+    Smart temporal parser: uses a cheap LLM to extract structured temporal
+    info from a question. Returns dict with:
+      - events: list of event descriptions to search for
+      - operator: "before" | "after" | "between" | "first" | "last" | "duration"
+      - date_hint: optional date string if the question mentions a specific date
+
+    Returns None if parsing fails or question isn't temporal.
+    """
+    prompt = f"""Extract temporal structure from this question about past conversations.
+Question (asked on {question_date}): "{question}"
+
+Return ONLY a JSON object with these fields:
+- "events": array of 1-2 key event/topic descriptions to search for (short phrases, max 10 words each)
+- "operator": one of "before", "after", "between", "first", "last", "duration", "sequence"
+- "date_hint": a date string if the question mentions a specific date/timeframe, else null
+- "search_queries": array of 1-3 alternative search queries that would find the relevant messages
+
+Example: "How many days between when I bought the car and when I sold it?"
+{{"events": ["bought the car", "sold the car"], "operator": "duration", "date_hint": null, "search_queries": ["bought car", "sold car"]}}
+
+JSON only, no explanation:"""
+
+    try:
+        r = client.messages.create(
+            model=model, max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = r.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text)
+    except Exception as e:
+        print(f"  temporal parse failed: {e}", file=sys.stderr, flush=True)
+        return None
+
+
 def _parse_date(date_str: Optional[str]):
     """Parse a LongMemEval date string like '2023/04/10 (Mon) 23:07' into a date."""
     if not date_str:
@@ -678,6 +780,14 @@ def main():
                     help="blend weight for temporal score (0=pure semantic, 1=pure temporal)")
     ap.add_argument("--hybrid-search", action="store_true",
                     help="enable BM25 + cosine RRF hybrid retrieval")
+    ap.add_argument("--rerank", action="store_true",
+                    help="enable LLM re-ranker (retrieve wide, re-rank with Haiku)")
+    ap.add_argument("--rerank-model", default="claude-haiku-4-5-20251001",
+                    help="model for re-ranking (default: Haiku)")
+    ap.add_argument("--rerank-k", type=int, default=30,
+                    help="how many candidates to retrieve before re-ranking")
+    ap.add_argument("--smart-temporal", action="store_true",
+                    help="use LLM to extract temporal structure from questions")
     args = ap.parse_args()
 
     full_dataset = load_dataset(args.dataset)
@@ -767,29 +877,64 @@ def main():
         is_count = bool(_re.search(r"\bhow many\b|\btotal number\b|\bhow much\b", qtxt, _re.I))
         effective_k = max(args.top_k, 25) if is_count else args.top_k
 
+        # If re-ranking, retrieve wider then narrow down
+        retrieve_k = args.rerank_k if args.rerank else effective_k
+
+        # Smart temporal: use LLM to extract temporal structure
         use_temporal = args.temporal and _is_temporal_question(qtxt)
+        extra_queries = []
+        if args.smart_temporal and use_temporal:
+            temporal_ctx = _extract_temporal_context(qtxt, qdate, client, args.rerank_model)
+            if temporal_ctx and temporal_ctx.get("search_queries"):
+                extra_queries = temporal_ctx["search_queries"]
+
         if use_temporal and args.hybrid_search:
             hits = retriever.search_hybrid_temporal(
-                qid, qtxt, query_vec, question_date=qdate, k=effective_k,
+                qid, qtxt, query_vec, question_date=qdate, k=retrieve_k,
                 temporal_weight=args.temporal_weight)
             use_chrono = True
             system = ANSWER_SYSTEM_TEMPORAL
         elif use_temporal:
             hits = retriever.search_temporal(
-                qid, query_vec, question_date=qdate, k=effective_k,
+                qid, query_vec, question_date=qdate, k=retrieve_k,
                 temporal_weight=args.temporal_weight)
             use_chrono = True
             system = ANSWER_SYSTEM_TEMPORAL
         elif args.hybrid_search:
-            hits = retriever.search_hybrid(qid, qtxt, query_vec, k=effective_k)
+            hits = retriever.search_hybrid(qid, qtxt, query_vec, k=retrieve_k)
             use_chrono = False
             system = ANSWER_SYSTEM
         else:
-            hits = retriever.search(qid, query_vec, k=effective_k)
+            hits = retriever.search(qid, query_vec, k=retrieve_k)
             use_chrono = False
             system = ANSWER_SYSTEM
 
-        hits_text = format_hits(hits, chronological=use_chrono)
+        # Smart temporal: merge results from alternative search queries
+        if extra_queries:
+            seen_contents = {t.content[:100] for _, t in hits}
+            for eq in extra_queries[:3]:
+                eq_vec = embed_one(eq)
+                if eq_vec is None:
+                    continue
+                if use_temporal and args.hybrid_search:
+                    eq_hits = retriever.search_hybrid_temporal(
+                        qid, eq, eq_vec, question_date=qdate, k=5,
+                        temporal_weight=args.temporal_weight)
+                elif args.hybrid_search:
+                    eq_hits = retriever.search_hybrid(qid, eq, eq_vec, k=5)
+                else:
+                    eq_hits = retriever.search(qid, eq_vec, k=5)
+                for score, turn in eq_hits:
+                    if turn.content[:100] not in seen_contents:
+                        hits.append((score * 0.9, turn))  # slight penalty for alt-query
+                        seen_contents.add(turn.content[:100])
+
+        # LLM re-ranker: narrow down wide retrieval to effective_k
+        if args.rerank and len(hits) > effective_k:
+            hits = retriever.rerank_with_llm(
+                hits, qtxt, client, args.rerank_model, k=effective_k)
+
+        hits_text = format_hits(hits[:effective_k], chronological=use_chrono)
         try:
             hyp = answer_with_claude(client, args.answer_model, qtxt, hits_text,
                                      qdate, thinking_budget=args.thinking_budget,

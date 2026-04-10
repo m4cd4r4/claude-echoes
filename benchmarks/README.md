@@ -2,7 +2,7 @@
 
 claude-echoes is a retrieval system. Its job is to find the right past message when you ask a question in natural language. This directory contains an honest end-to-end evaluation of that capability on a public, peer-reviewed benchmark.
 
-> **tl;dr** — **81.0% on LongMemEval_S** using **Sonnet 4.6** + pgvector + BM25 hybrid retrieval + temporal-aware re-ranking + targeted prompt engineering. **100% on single-session-user retrieval** (70/70). Code, raw outputs, and evaluation script are all in this directory. If you think these numbers are wrong, run them yourself in ~15 minutes.
+> **tl;dr** — **86.4% on LongMemEval_S** using **Sonnet 4.6** + pgvector + BM25 hybrid retrieval + temporal-aware re-ranking + LLM re-ranker + smart temporal parsing + targeted prompt engineering. **100% on single-session-user retrieval** (70/70). Code, raw outputs, and evaluation script are all in this directory. If you think these numbers are wrong, run them yourself in ~15 minutes.
 
 ## What we ran
 
@@ -48,7 +48,7 @@ claude-echoes is a retrieval system. Its job is to find the right past message w
 
 **Preference improvements were modest.** Sonnet went 53.3% → 56.7% with BM25, Haiku stayed flat. Preferences aren't primarily a vocabulary problem; they're an aggregation problem across many weak signals. This needs a different approach (probably clustering or explicit preference extraction).
 
-### Section 4 patch: prompt engineering + dynamic top-k (the final push)
+### Section 4 patch: prompt engineering + dynamic top-k
 
 Three targeted changes on top of the BM25+temporal config, informed by grounded failure analysis of the 8 weakest outputs:
 
@@ -67,16 +67,37 @@ Three targeted changes on top of the BM25+temporal config, informed by grounded 
 | single-session-assistant | 94.6% | 92.9% | -1.7 |
 | **OVERALL** | **76.4%** | **81.0%** | **+4.6** |
 
-**The retrieval was already finding the right content.** Sonnet was refusing to commit on preference questions and failing to enumerate all instances on counting questions. Three prompt-level changes, zero new retrieval logic, +4.6 points.
+### Section 5: LLM re-ranker + smart temporal parser (the 86.4% push)
+
+Two new retrieval improvements on top of the full patched pipeline:
+
+1. **LLM re-ranker:** retrieve 30 candidates, then ask Haiku to score each one's relevance to the question (0-10). Re-sort by LLM score, take top-k. Catches cases where semantically similar but irrelevant content outranks the actual answer in embedding space. Falls back to original order on parse failure.
+
+2. **Smart temporal parser:** for detected temporal questions, use Haiku to extract structured temporal context (event descriptions, temporal operators, alternative search queries). Run additional retrievals against the extracted queries and merge results before re-ranking. This finds both sides of "how long between X and Y" questions even when one event has low cosine similarity to the original query.
+
+| Category | Sonnet patched (81%) | **Sonnet reranked** | Delta |
+|---|---|---|---|
+| single-session-user | 100.0% | **100.0%** | 0.0 (still perfect) |
+| single-session-assistant | 92.9% | **98.2%** | **+5.3** |
+| knowledge-update | 88.5% | **93.6%** | **+5.1** |
+| temporal-reasoning | 75.9% | **84.2%** | **+8.3** |
+| multi-session | 67.7% | **74.4%** | **+6.7** |
+| single-session-preference | 76.7% | 76.7% | 0.0 |
+| **OVERALL** | **81.0%** | **86.4%** | **+5.4** |
+
+**Every category except preference improved.** Temporal reasoning gained +8.3 points from the smart temporal parser finding both events. Multi-session gained +6.7 from the re-ranker filtering out noise when synthesizing across sessions. The re-ranker adds one Haiku call per question (~$0.001 each) - negligible cost for a meaningful accuracy gain.
+
+**Haiku also benefited massively:** 64.4% -> 76.8% (+12.4 points) with the same re-ranker + smart temporal features. The preference category jumped from 33.3% to 83.3% on Haiku - the re-ranker solved what prompt engineering alone couldn't.
 
 ### Cost / quality pareto frontier
 
 | Config | Score | Approx cost per 500 queries | Notes |
 |---|---|---|---|
 | Haiku baseline | 58.6% | ~$2 | Vanilla pgvector, no tuning |
-| Haiku + BM25 + temporal | **64.4%** | ~$3 | **Best Haiku config** |
-| Sonnet + BM25 + temporal | 76.4% | ~$5 | Pre-patch |
-| **Sonnet + BM25 + temporal + patch** | **81.0%** | ~$5 | **Best overall** |
+| Haiku + BM25 + temporal | 64.4% | ~$3 | Previous best Haiku |
+| Haiku + reranker + smart temporal | **76.8%** | ~$5 | **Best Haiku config** |
+| Sonnet + BM25 + temporal + patch | 81.0% | ~$5 | Previous best overall |
+| **Sonnet + reranker + smart temporal** | **86.4%** | ~$8 | **Best overall** |
 
 **The sweet spot depends on use case:**
 
@@ -88,14 +109,14 @@ We have not run Opus on this benchmark. The Sonnet→Opus gap on similar long-co
 
 ## What this means
 
-**Where retrieval wins:** The single-session categories (asst 89%, user 87%) and knowledge-update (81%) are where pure semantic similarity excels. If your question is "find the message where I said X" or "what was the updated answer to Y?", claude-echoes does the job.
+**Where retrieval wins:** The single-session categories (asst 98%, user 100%) and knowledge-update (94%) are strong. If your question is "find the message where I said X" or "what was the updated answer to Y?", claude-echoes does the job reliably.
 
-**Where retrieval hits a ceiling:**
-- **Temporal reasoning (42%)** — "how many weeks between event A and event B" requires pulling *both* events and computing a date delta. Pure cosine similarity often pulls two hits from the same event. Our temporal re-ranker with session diversity helps but doesn't fully solve it.
-- **Multi-session (51%)** — requires synthesizing across 2+ sessions. Top-K retrieval with diversity constraints helps but the LLM still struggles when the answer requires connecting 3+ dots.
-- **Preference (33%)** — preferences are implicit and scattered ("I prefer X" is never stated in one clean message). Semantic search isn't the right tool for aggregating weak signals.
+**Where we've pushed past previous ceilings:**
+- **Temporal reasoning (84.2%)** — the smart temporal parser + re-ranker pushed this from 36% baseline to 84%. The parser extracts event descriptions and runs targeted retrievals for each event, solving the "only finds one side of the comparison" problem.
+- **Multi-session (74.4%)** — the re-ranker filters out noise when synthesizing across sessions. Still the hardest category, but +27 points over baseline.
+- **Preference (76.7-83.3%)** — the LLM re-ranker solved what prompt engineering alone couldn't on Haiku (33% -> 83%). Preferences are implicit and scattered, but the re-ranker judges relevance better than cosine distance.
 
-**None of these are exotic problems.** They're the classic limits of semantic retrieval. Every memory system hits them. Claims of 90%+ on this benchmark should be examined carefully — see the "Comparison to other systems" section below.
+**The remaining gap to 100% is genuine.** Multi-session at 74% and temporal at 84% still require reasoning that single-pass retrieval can't fully solve. But 86.4% with local embeddings and standard pgvector is a strong result for a tool that ships as a Claude Code hook.
 
 ## Reproducing these results
 
@@ -139,14 +160,14 @@ python run_longmemeval.py \
   --hybrid-search --temporal \
   --out results/haiku_bm25_temporal.jsonl
 
-# 5b. Best overall: Sonnet + BM25 + temporal (~3 min, ~$25)
+# 5b. Best Sonnet config: + re-ranker + smart temporal (~6 min, ~$8)
 python run_longmemeval.py \
   --dataset data/longmemeval_s_cleaned.json \
   --embeddings cache/s_embeddings.npz \
   --answer-model claude-sonnet-4-6 \
   --top-k 15 \
-  --hybrid-search --temporal \
-  --out results/sonnet_bm25_temporal.jsonl
+  --hybrid-search --temporal --rerank --smart-temporal \
+  --out results/sonnet_reranked.jsonl
 
 # 6. Judge with GPT-4o-mini (~5 min, ~$0.50)
 python official/src/evaluation/evaluate_qa.py \
@@ -174,12 +195,12 @@ LongMemEval is actively reported on by multiple teams in 2026. Here's where clau
 
 | System | LongMemEval_S | Embedding | Approach |
 |---|---|---|---|
-| **claude-echoes** (Sonnet 4.6, full stack) | **81.0%** | nomic-embed-text (local, free) | pgvector cosine + BM25 RRF + temporal re-rank + prompt tuning |
-| **claude-echoes** (Haiku 4.5, BM25+temporal) | **64.4%** | nomic-embed-text (local, free) | pgvector cosine + BM25 RRF + temporal re-rank |
+| **claude-echoes** (Sonnet 4.6, full stack) | **86.4%** | nomic-embed-text (local, free) | pgvector cosine + BM25 RRF + temporal re-rank + LLM re-ranker + smart temporal + prompt tuning |
+| **claude-echoes** (Haiku 4.5, full stack) | **76.8%** | nomic-embed-text (local, free) | Same pipeline, cheaper model |
 | Atlas Memory | 90.18% | ? | Re-ranking + summarization pipeline |
 | MemPalace | [96.6% claimed](https://github.com/milla-jovovich/mempalace) | ChromaDB default | ["invented terms for known things... grandiose claims... benchmaxx fraud with hardcoded patterns for answers"](https://x.com/banteg/status/2041427374487605614) |
 
-**Atlas Memory (90.18%)** uses a much more sophisticated pipeline with LLM-based re-ranking and summarization. If you need that level of accuracy and are willing to pay for the extra LLM calls, it's the right choice. claude-echoes aims for a different point on the curve: ~60% with one small local embedding call and one small LLM call per query.
+**Atlas Memory (90.18%)** uses a more sophisticated pipeline with LLM-based re-ranking and summarization. At 86.4%, claude-echoes is now within 4 points - and we use a local free embedding model (nomic-embed-text) with standard pgvector, no proprietary infrastructure. The gap is closing with each improvement round, all using standard, auditable techniques.
 
 **MemPalace (96.6% claimed)** — [examined by @banteg](https://x.com/banteg/status/2041427374487605614) who found hardcoded benchmark patterns in the eval code. We have no independent verification of any MemPalace number.
 
@@ -193,7 +214,9 @@ LongMemEval is actively reported on by multiple teams in 2026. Here's where clau
 | `cache/s_embeddings.npz` | Not checked in - 668 MB, regenerate with `--embed-only` |
 | `results/haiku_full.jsonl` | Baseline Haiku raw outputs (500 questions) |
 | `results/haiku_bm25_temporal.jsonl` | Best Haiku config raw outputs (64.4%) |
-| `results/sonnet_patched.jsonl` | **Best overall raw outputs (81.0%)** |
+| `results/sonnet_patched.jsonl` | Previous best Sonnet raw outputs (81.0%) |
+| `results/sonnet_reranked.jsonl` | **Best overall raw outputs (86.4%)** |
+| `results/haiku_reranked.jsonl` | Best Haiku raw outputs (76.8%) |
 | `results/sonnet_bm25_temporal.jsonl` | Pre-patch Sonnet raw outputs (76.4%) |
 | `results/*.eval-results-gpt-4o-mini` | GPT-4o-mini judge outputs for each run |
 | `official/` | Clone of LongMemEval repo (for the judge script, gitignored) |
