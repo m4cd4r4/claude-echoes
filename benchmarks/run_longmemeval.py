@@ -303,6 +303,50 @@ Return format: [[index, score], [index, score], ...]"""
                   file=sys.stderr, flush=True)
             return hits[:k]
 
+    def rerank_with_ollama(self, hits: list[tuple[float, Turn]], question: str,
+                           model: str = "qwen2.5:7b",
+                           k: int = TOP_K) -> list[tuple[float, Turn]]:
+        """LLM re-ranker using local Ollama. Free, for iteration."""
+        if not hits or len(hits) <= k:
+            return hits
+        candidate_lines = []
+        for i, (score, turn) in enumerate(hits):
+            content = turn.content[:400].replace("\n", " ")
+            candidate_lines.append(f"[{i}] {turn.role}: {content}")
+        candidates_text = "\n".join(candidate_lines)
+        rerank_prompt = (
+            f'Given this question: "{question}"\n\n'
+            f"Score each message's relevance (0-10). "
+            f"Return ONLY a JSON array of [index, score] pairs.\n\n"
+            f"Messages:\n{candidates_text}\n\n"
+            f"Return: [[index, score], ...]"
+        )
+        s = get_session()
+        try:
+            r = s.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": model, "prompt": rerank_prompt, "stream": False,
+                      "options": {"temperature": 0.0, "num_predict": 512}},
+                timeout=60,
+            )
+            if r.status_code != 200:
+                return hits[:k]
+            text = r.json().get("response", "").strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            scores = json.loads(text)
+            llm_scores = {int(p[0]): float(p[1]) for p in scores
+                         if isinstance(p, (list, tuple)) and len(p) >= 2}
+            reranked = sorted(enumerate(hits),
+                            key=lambda x: llm_scores.get(x[0], 0), reverse=True)
+            return [(llm_scores.get(i, hits[i][0]), hits[i][1])
+                    for i, _ in reranked[:k]]
+        except Exception as e:
+            print(f"  ollama rerank failed: {e}", file=sys.stderr, flush=True)
+            return hits[:k]
+
     def search_hybrid(self, qid: str, query_text: str, query_vec: np.ndarray,
                       k: int = TOP_K, wide_k: int = 30,
                       rrf_k: int = 60) -> list[tuple[float, Turn]]:
@@ -620,6 +664,38 @@ JSON only, no explanation:"""
         return None
 
 
+def _extract_temporal_context_ollama(question: str, question_date: str,
+                                     model: str = "qwen2.5:7b") -> Optional[dict]:
+    """Smart temporal parser using local Ollama. Free, for iteration."""
+    prompt = (
+        f"Extract temporal structure from this question about past conversations.\n"
+        f'Question (asked on {question_date}): "{question}"\n\n'
+        f"Return ONLY a JSON object with:\n"
+        f'- "events": array of 1-2 key event descriptions (short phrases)\n'
+        f'- "operator": one of "before", "after", "between", "first", "last", "duration", "sequence"\n'
+        f'- "search_queries": array of 1-3 alternative search queries\n\n'
+        f"JSON only:"
+    )
+    s = get_session()
+    try:
+        r = s.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False,
+                  "options": {"temperature": 0.0, "num_predict": 256}},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return None
+        text = r.json().get("response", "").strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 def _parse_date(date_str: Optional[str]):
     """Parse a LongMemEval date string like '2023/04/10 (Mon) 23:07' into a date."""
     if not date_str:
@@ -684,9 +760,12 @@ Your job: answer the question using ONLY information in the retrieved messages.
 Rules:
 - If the retrieved messages contain the answer, give it concisely and directly.
 - If the question is about "when" something happened, quote the exact date from the message timestamp if given.
-- For counting questions ("how many X"), scan ALL retrieved messages and enumerate every distinct instance. Do not stop at the first match.
+- For counting questions ("how many X"), scan ALL retrieved messages and enumerate every distinct instance. Do not stop at the first match. If some instances are mentioned indirectly or in passing, still count them.
+- For "how many total" or aggregation questions, add up ALL instances found across ALL messages, even if they come from different conversations or time periods.
 - For preference questions ("what would I like", "recommend based on my taste"), infer the user's likely preference from ANY relevant past context - even a single mention of a related topic, hobby, or prior request. Synthesize; do not refuse just because the evidence is indirect.
-- Only say "not enough information" if the retrieved messages are genuinely unrelated to the question. If there is ANY topical overlap, attempt an answer.
+- For questions about "who did I go with" or companions, look for mentions of people in the context surrounding the event, even if the companion isn't explicitly stated for that specific activity.
+- NEVER refuse to answer. Always give your best answer from the available evidence. If you can only find partial information, give the partial answer - a partial answer is always better than "not enough information". Only refuse if the messages are completely unrelated to the question.
+- If you find some instances but suspect there might be more you can't see, report what you found and note the count may be incomplete - but still give a number.
 - Keep answers short. No preamble. No "based on the retrieved messages..." filler.
 """
 
@@ -705,7 +784,9 @@ Rules:
 - When the question asks about "the first" or "the last" occurrence, use chronological order to determine which one.
 - If a fact was updated across multiple messages, the most recent version is the current answer.
 - If the retrieved messages contain the answer, give it concisely and directly.
-- If the retrieved messages do NOT contain enough information to answer, say so explicitly. Do not guess.
+- When the question asks "how old was I when X", look for both the user's age/birth year AND the date of event X in the messages, then compute the answer.
+- When the question mentions "last Saturday" or "N days ago", compute the actual date relative to the question date, then find messages from that date.
+- NEVER refuse to answer. Always give your best answer from the available evidence. A partial or approximate answer is always better than "not enough information". Use inference from surrounding context when direct evidence is incomplete.
 - Keep answers short. No preamble.
 """
 
@@ -729,6 +810,38 @@ def format_hits(hits: list[tuple[float, Turn]], chronological: bool = False) -> 
             ts = f"[{t.timestamp}] " if t.timestamp else ""
             lines.append(f"(#{rank}) {ts}{t.role}: {t.content}")
         return "\n".join(lines)
+
+def answer_with_ollama(model: str, question: str, hits_text: str,
+                       question_date: str,
+                       system_prompt: str = ANSWER_SYSTEM,
+                       chronological: bool = False) -> str:
+    """Answer using local Ollama model. Free, for iterating on retrieval changes."""
+    label = "chronological order" if chronological else "ranked by relevance"
+    user_msg = (
+        f"Question (asked on {question_date}):\n{question}\n\n"
+        f"Retrieved past messages ({label}):\n{hits_text}\n\n"
+        f"Your answer:"
+    )
+    prompt = f"System: {system_prompt}\n\nUser: {user_msg}"
+    s = get_session()
+    try:
+        r = s.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 512},
+            },
+            timeout=120,
+        )
+        if r.status_code != 200:
+            return ""
+        return r.json().get("response", "").strip()
+    except Exception as e:
+        print(f"  ollama answer failed: {e}", file=sys.stderr, flush=True)
+        return ""
+
 
 def answer_with_claude(client, model: str, question: str, hits_text: str,
                        question_date: str, thinking_budget: int = 0,
@@ -788,6 +901,10 @@ def main():
                     help="how many candidates to retrieve before re-ranking")
     ap.add_argument("--smart-temporal", action="store_true",
                     help="use LLM to extract temporal structure from questions")
+    ap.add_argument("--ollama-answer", action="store_true",
+                    help="use local Ollama model for answering (free, for iteration)")
+    ap.add_argument("--ollama-answer-model", default="qwen2.5:7b",
+                    help="Ollama model for answering (default: qwen2.5:7b)")
     args = ap.parse_args()
 
     full_dataset = load_dataset(args.dataset)
@@ -852,8 +969,10 @@ def main():
                     pass
         print(f"resume: skipping {len(done_ids)} already-answered questions")
 
-    from anthropic import Anthropic
-    client = Anthropic()   # picks up ANTHROPIC_API_KEY from env
+    client = None
+    if not args.ollama_answer:
+        from anthropic import Anthropic
+        client = Anthropic()   # picks up ANTHROPIC_API_KEY from env
 
     todo = [q for q in dataset if q["question_id"] not in done_ids]
     print(f"answering {len(todo)} questions with {args.answer_model} "
@@ -884,7 +1003,10 @@ def main():
         use_temporal = args.temporal and _is_temporal_question(qtxt)
         extra_queries = []
         if args.smart_temporal and use_temporal:
-            temporal_ctx = _extract_temporal_context(qtxt, qdate, client, args.rerank_model)
+            if args.ollama_answer:
+                temporal_ctx = _extract_temporal_context_ollama(qtxt, qdate, args.ollama_answer_model)
+            else:
+                temporal_ctx = _extract_temporal_context(qtxt, qdate, client, args.rerank_model)
             if temporal_ctx and temporal_ctx.get("search_queries"):
                 extra_queries = temporal_ctx["search_queries"]
 
@@ -931,14 +1053,23 @@ def main():
 
         # LLM re-ranker: narrow down wide retrieval to effective_k
         if args.rerank and len(hits) > effective_k:
-            hits = retriever.rerank_with_llm(
-                hits, qtxt, client, args.rerank_model, k=effective_k)
+            if args.ollama_answer:
+                hits = retriever.rerank_with_ollama(
+                    hits, qtxt, args.ollama_answer_model, k=effective_k)
+            else:
+                hits = retriever.rerank_with_llm(
+                    hits, qtxt, client, args.rerank_model, k=effective_k)
 
         hits_text = format_hits(hits[:effective_k], chronological=use_chrono)
         try:
-            hyp = answer_with_claude(client, args.answer_model, qtxt, hits_text,
-                                     qdate, thinking_budget=args.thinking_budget,
-                                     system_prompt=system, chronological=use_chrono)
+            if args.ollama_answer:
+                hyp = answer_with_ollama(
+                    args.ollama_answer_model, qtxt, hits_text, qdate,
+                    system_prompt=system, chronological=use_chrono)
+            else:
+                hyp = answer_with_claude(client, args.answer_model, qtxt, hits_text,
+                                         qdate, thinking_budget=args.thinking_budget,
+                                         system_prompt=system, chronological=use_chrono)
         except Exception as e:
             return {"question_id": qid, "hypothesis": "", "error": str(e)}
         return {
