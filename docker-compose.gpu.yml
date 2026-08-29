@@ -1,0 +1,33 @@
+# GPU override for the embedding model.
+#
+# The base compose is CPU-only on purpose: it has to work on any machine, and
+# CPU is fine for the steady-state hook, which embeds one message at a time as
+# you work.
+#
+# It is NOT fine for a backfill. Measured on this machine (Quadro RTX 5000,
+# nomic-embed-text): CPU answers a single /api/embeddings call in ~3.3s, so a
+# 108k-message history would take about 99 hours. That is the difference
+# between "index your existing history" being a feature and being a slogan.
+#
+# Use it with:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Requires the NVIDIA Container Toolkit. Verify the runtime can see the card
+# BEFORE starting the stack, because a missing toolkit makes compose fail to
+# create the container rather than quietly falling back to CPU:
+#   docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+#
+# Confirm which one you actually got - the log line is the only honest answer,
+# and "it felt faster" is not a measurement:
+#   docker logs echoes-ollama | grep "inference compute"
+#     library=cpu    -> the override is not applied
+#     library=cuda   -> GPU in use
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

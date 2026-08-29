@@ -138,39 +138,113 @@ async def search(
     project: Optional[str] = None,
     role: Optional[str] = None,
     days: Optional[int] = Query(None, ge=1, le=3650),
+    hybrid: bool = Query(True),
+    candidates: int = Query(60, ge=10, le=500),
 ):
+    """Hybrid retrieval: dense vector + lexical BM25-ish, fused with RRF.
+
+    This endpoint used to run pure cosine, while the benchmark harness that
+    produced the README's headline number ran vector + BM25 + RRF. That gap
+    mattered: the shipped /recall was materially weaker than the configuration
+    the project is measured on, and nothing said so.
+
+    The lexical half is Postgres full-text ranking, not true BM25. It is close
+    enough in behaviour for the job it does here - catching the exact-token
+    matches that embeddings miss, like an error string, a flag, or a commit sha -
+    and it costs nothing extra, because sql/001_init.sql has always created
+    idx_messages_fts on to_tsvector('english', content) and nothing has ever
+    queried it. The expression below is written to match that index exactly, so
+    it is used rather than rebuilt per query.
+
+    RRF (Cormack et al.) fuses by RANK, not by score, which is the point: cosine
+    similarity and ts_rank are not on comparable scales, so any weighted sum of
+    the two raw scores is arbitrary. k=60 is the constant from the paper.
+
+    hybrid=false restores the old pure-vector path, so the two are comparable on
+    the same data without redeploying.
+    """
     qvec = await embed_text(app.state.http, q)
     if qvec is None:
         raise HTTPException(503, "embedding service unavailable")
 
-    conds = ["embedding IS NOT NULL"]
-    params: list = [qvec]
-    idx = 2
+    if role and role not in ("user", "assistant"):
+        raise HTTPException(400, "role must be 'user' or 'assistant'")
 
+    # Filters are shared by both arms, so a project/role/days filter cannot
+    # produce a hit from one arm that the other was never allowed to see.
+    #
+    # The placeholder numbering has to follow the MODE, not a fixed offset: the
+    # vector-only SQL never mentions the query text, and asyncpg rejects a
+    # parameter that appears in the argument list but not in the statement. A
+    # fixed "start filters at $3" produced a 500 on every hybrid=false call
+    # while hybrid=true worked, which is exactly the kind of break that hides
+    # behind a default value.
+    params: list = [qvec] if not hybrid else [qvec, q]
+    idx = len(params) + 1
+
+    conds = []
     if project:
         conds.append(f"project = ${idx}")
         params.append(project); idx += 1
     if role:
-        if role not in ("user", "assistant"):
-            raise HTTPException(400, "role must be 'user' or 'assistant'")
         conds.append(f"role = ${idx}")
         params.append(role); idx += 1
     if days:
         conds.append(f"created_at > NOW() - INTERVAL '{int(days)} days'")
 
-    sql = f"""
-        SELECT id, session_id, project, role, content, model, created_at,
-               1 - (embedding <=> $1::vector) AS similarity
-        FROM messages
-        WHERE {" AND ".join(conds)}
-        ORDER BY embedding <=> $1::vector
-        LIMIT {int(limit)}
-    """
+    where_extra = (" AND " + " AND ".join(conds)) if conds else ""
+
+    if not hybrid:
+        sql = f"""
+            SELECT id, session_id, project, role, content, model, created_at,
+                   1 - (embedding <=> $1::vector) AS score
+            FROM messages
+            WHERE embedding IS NOT NULL{where_extra}
+            ORDER BY embedding <=> $1::vector
+            LIMIT {int(limit)}
+        """
+    else:
+        sql = f"""
+            WITH vec AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector) AS rnk
+                FROM messages
+                WHERE embedding IS NOT NULL{where_extra}
+                ORDER BY embedding <=> $1::vector
+                LIMIT {int(candidates)}
+            ),
+            lex AS (
+                SELECT id, ROW_NUMBER() OVER (
+                           ORDER BY ts_rank(to_tsvector('english', content),
+                                            websearch_to_tsquery('english', $2)) DESC
+                       ) AS rnk
+                FROM messages
+                WHERE to_tsvector('english', content)
+                      @@ websearch_to_tsquery('english', $2){where_extra}
+                ORDER BY ts_rank(to_tsvector('english', content),
+                                 websearch_to_tsquery('english', $2)) DESC
+                LIMIT {int(candidates)}
+            ),
+            fused AS (
+                SELECT COALESCE(v.id, l.id) AS id,
+                       COALESCE(1.0 / (60 + v.rnk), 0)
+                     + COALESCE(1.0 / (60 + l.rnk), 0) AS score
+                FROM vec v
+                FULL OUTER JOIN lex l ON v.id = l.id
+            )
+            SELECT m.id, m.session_id, m.project, m.role, m.content, m.model,
+                   m.created_at, f.score
+            FROM fused f
+            JOIN messages m ON m.id = f.id
+            ORDER BY f.score DESC, m.created_at DESC
+            LIMIT {int(limit)}
+        """
+
     async with app.state.pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
     return {
         "query": q,
+        "mode": "hybrid" if hybrid else "vector",
         "count": len(rows),
         "results": [
             {
@@ -181,7 +255,7 @@ async def search(
                 "content": r["content"],
                 "model": r["model"],
                 "created_at": r["created_at"].isoformat(),
-                "similarity": round(float(r["similarity"]), 4),
+                "similarity": round(float(r["score"]), 4),
             }
             for r in rows
         ],
