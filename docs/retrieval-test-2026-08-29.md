@@ -143,3 +143,69 @@ version could not produce.
 | Median | ~130ms |
 | Embed | 39-71ms |
 | Probe | 3-40ms (was up to 139,031ms) |
+
+---
+
+# The re-ranker
+
+Added because retrieval matches on shared vocabulary, and a question sometimes
+shares none with its answer. The case that forced it: **"what did we decide
+about the ERF hero video"** returned the right *sessions* but never the
+decision, because the decision says "triptych" and "IMG_5506" and the question
+says neither. No amount of lexical relaxation reaches words that are absent.
+
+Runs locally on ollama, so "no conversation data leaves the machine" survives.
+ONE batched call scores all 24 candidates; scoring them singly would be 24
+generations per query for the same answer.
+
+| | score | MRR | latency |
+|---|---|---|---|
+| RRF only | 6/7 | **0.595** | 52-731ms |
+| + re-ranker (qwen2.5:7b) | 6/7 | **0.857** | 385-1091ms |
+
+**The pass count is the wrong metric here and MRR is why the work was kept.**
+Both configurations score 6/7. What changed is that every surviving hit moved
+to **rank 1** - previously they were scattered at ranks 1, 2 and 3. Reporting
+only "6/7" would have made this change look like a waste of an afternoon.
+
+## Model size is not a detail: 3B measured WORSE than no re-ranker
+
+`qwen2.5:3b-instruct` scored **5/7**, below the 6/7 RRF baseline. It fixed the
+ERF case dramatically and *demoted* cases RRF already had right - Lighthouse
+1->5, Turbopack 1->4, and it lost AzurePrep entirely. A weak judge is worse
+than no judge, because it overrides a ranking that was already correct.
+
+`qwen2.5:7b-instruct` fixed all of it. 4.7 GB, ~400-1700ms a query on the
+Quadro RTX 5000.
+
+## The GPU stopped being optional
+
+`docker-compose.gpu.yml` existed since the backfill and had never been enabled -
+`ollama ps` read `100% CPU`. A 7B judge on CPU is not viable, so re-ranking
+turns the GPU override from a backfill convenience into the supported path.
+Verified `library=CUDA`, `Quadro RTX 5000`, 14.9 GiB available, both models
+resident at `100% GPU`.
+
+## Fails OPEN, deliberately
+
+A re-ranker that times out, returns junk, or judges nothing relevant leaves the
+RRF order untouched and reports why in `"rerank"`. A silent quality regression
+is recoverable; a silent empty result set is not. This was not theoretical - the
+first live call returned `rerank: "TimeoutError"` after 60s (a cold model load)
+and the endpoint still answered correctly from RRF order.
+
+Startup now warms both models in a background task, because a cold re-ranker
+load takes longer than its own timeout: without it the first query of every
+fresh stack silently falls back.
+
+## The remaining failure is REACH, not ranking
+
+`what fixes a scraper getting 429 on every request` -> wants `curl_cffi`.
+Checked directly: at `candidates=500` the answer is **not in the pool at all**,
+so no re-ranker can reach it. Neither arm finds it - the lexical terms do not
+match and the question's embedding is not near the answer's. Only rewriting the
+question into a hypothetical answer (HyDE) or enriching documents at index time
+would close this, and both were deferred.
+
+Worth stating plainly: **a re-ranker reorders what retrieval found. It cannot
+retrieve.**

@@ -17,7 +17,7 @@ const CASES = [
   { q: 'what fixes a scraper getting 429 on every request',             want: /curl_cffi/i,     note: 'TLS fingerprinting, not rate limit' },
 ];
 
-let pass = 0;
+let pass = 0, rr = 0;
 for (const c of CASES) {
   const url = `${BASE}/search?q=${encodeURIComponent(c.q)}&limit=${LIMIT}`;
   let hit = false, rank = 0, err = '';
@@ -31,9 +31,9 @@ for (const c of CASES) {
     const rows = j.results || [];
     rows.forEach((m, i) => { if (!hit && c.want.test(m.content || '')) { hit = true; rank = i + 1; } });
   } catch (e) { err = e.message; }
-  if (hit) pass++;
+  if (hit) { pass++; rr += 1 / rank; }
   console.log(`${hit ? 'PASS' : 'FAIL'} ${hit ? '@' + rank : '  '}  ${String(Date.now()-t0).padStart(6)}ms  ${c.q}  ${globalThis.__t||''}`);
   if (!hit) console.log(`        want ${c.want} - ${c.note}${err ? ' | ERR ' + err : ''}`);
 }
-console.log(`\n${pass}/${CASES.length} at top-${LIMIT}`);
+console.log(`\n${pass}/${CASES.length} at top-${LIMIT}   MRR ${(rr / CASES.length).toFixed(3)}`);
 process.exit(pass === CASES.length ? 0 : 1);

@@ -41,6 +41,7 @@ services:
       ECHOES_DB_DSN: postgresql://echoes:echoes@postgres:5432/echoes
       ECHOES_OLLAMA_URL: http://ollama:11434
       ECHOES_OLLAMA_MODEL: nomic-embed-text
+      ECHOES_RERANK_MODEL: qwen2.5:7b-instruct
     depends_on:
       postgres:
         condition: service_healthy

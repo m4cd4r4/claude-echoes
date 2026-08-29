@@ -12,6 +12,8 @@ in 5 minutes, something has gone wrong.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import time
 import re
@@ -31,6 +33,27 @@ OLLAMA_URL   = os.environ.get("ECHOES_OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("ECHOES_OLLAMA_MODEL", "nomic-embed-text")
 EMBED_TIMEOUT_S = float(os.environ.get("ECHOES_EMBED_TIMEOUT", "4"))
 MAX_CONTENT_CHARS = 8000   # nomic context window is 8192 tokens; clip safely
+
+# --- re-ranker -------------------------------------------------------------
+# Retrieval matches on shared vocabulary. When a question and its answer share
+# none, both arms miss: "what did we decide about the ERF hero video" never
+# reaches the message that says "triptych" and "IMG_5506", because the question
+# contains neither word. No amount of lexical relaxation fixes that - the terms
+# are simply absent.
+#
+# A re-ranker reads the question against each candidate and judges relevance
+# directly, so it does not need shared words. This is the component the README's
+# 86.4% LongMemEval figure was measured WITH (benchmarks/run_longmemeval.py) and
+# that /search shipped WITHOUT.
+#
+# It runs locally on ollama, so the "no conversation data leaves the machine"
+# property survives. One BATCHED call scores every candidate at once - scoring
+# them individually would be N generations per query and is not worth it.
+RERANK_MODEL   = os.environ.get("ECHOES_RERANK_MODEL", "qwen2.5:3b-instruct")
+RERANK_ENABLED = os.environ.get("ECHOES_RERANK", "1") not in ("0", "false", "False")
+RERANK_POOL    = 24    # candidates handed to the model
+RERANK_SNIPPET = 420   # chars of each candidate the model sees
+RERANK_TIMEOUT = 60
 
 # --- models ---------------------------------------------------------------
 
@@ -60,6 +83,31 @@ async def lifespan(app: FastAPI):
     app.state.http = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=EMBED_TIMEOUT_S)
     )
+    # Warm both models in the background. A cold load of the re-ranker costs
+    # ~60s, which is longer than its own timeout - so without this the FIRST
+    # query of a fresh stack always reports rerank=TimeoutError and silently
+    # falls back to RRF order. Measured 2026-08-29. Fire-and-forget: a warm-up
+    # that blocks startup would make the server look hung instead of slow.
+    async def _warm():
+        try:
+            await embed_text(app.state.http, "warmup")
+        except Exception:
+            pass
+        if RERANK_ENABLED:
+            try:
+                async with app.state.http.post(
+                    OLLAMA_URL + "/api/generate",
+                    json={"model": RERANK_MODEL, "prompt": "Reply with [1]",
+                          "stream": False, "keep_alive": -1,
+                          "options": {"num_predict": 8}},
+                    timeout=aiohttp.ClientTimeout(total=300),
+                ) as r:
+                    await r.read()
+            except Exception:
+                pass
+
+    app.state.warm = asyncio.create_task(_warm())
+
     yield
     await app.state.http.close()
     await app.state.pool.close()
@@ -172,6 +220,70 @@ async def pick_lex_query(conn, q: str, where_sql: str, where_args: list) -> Opti
     except Exception:
         return None
 
+
+async def rerank(http, q: str, rows: list, want: int) -> tuple:
+    """Reorder candidates by asking a small local model to judge relevance.
+
+    ONE batched call: the model sees the question and every numbered snippet,
+    and returns the indices it judges relevant, best first. Scoring candidates
+    one at a time would be N generations per query for the same answer.
+
+    Fails OPEN. A re-ranker that times out, returns nothing, or emits junk must
+    leave the RRF order untouched rather than empty the result set - a silent
+    quality regression is recoverable, a silent empty page is not. Every exit
+    path returns rows plus a reason string, so /search can report which ranking
+    the caller is actually looking at.
+    """
+    if not rows:
+        return rows, "no candidates"
+    lines = []
+    for i, r in enumerate(rows):
+        body = " ".join((r["content"] or "").split())[:RERANK_SNIPPET]
+        lines.append("[%d] (%s, %s) %s" % (i, r["role"], r["created_at"].strftime("%Y-%m-%d"), body))
+    prompt = (
+        "You rank past chat messages by how well they ANSWER a question.\n"
+        "A message can be highly relevant while sharing no words with the "
+        "question - judge the subject matter, not the wording.\n\n"
+        "QUESTION: " + q + "\n\nMESSAGES:\n" + "\n".join(lines) +
+        "\n\nReturn ONLY a JSON array of the message numbers that help answer "
+        "the question, best first, at most " + str(want) + ". No prose. Example: [3,0,7]"
+    )
+    try:
+        async with http.post(
+            OLLAMA_URL + "/api/generate",
+            json={"model": RERANK_MODEL, "prompt": prompt, "stream": False,
+                  "keep_alive": -1, "options": {"temperature": 0, "num_predict": 64}},
+            timeout=aiohttp.ClientTimeout(total=RERANK_TIMEOUT),
+        ) as r:
+            if r.status != 200:
+                return rows, "http %d" % r.status
+            raw = (await r.json()).get("response", "")
+    except Exception as e:
+        return rows, type(e).__name__
+
+    m = re.search(r"\[[^\]]*\]", raw)
+    if not m:
+        return rows, "no json array"
+    try:
+        order = [int(x) for x in json.loads(m.group(0))]
+    except Exception:
+        return rows, "unparseable"
+
+    seen, picked = set(), []
+    for i in order:
+        if 0 <= i < len(rows) and i not in seen:
+            seen.add(i)
+            picked.append(rows[i])
+    if not picked:
+        # The model judged nothing relevant. That is a real answer for a
+        # question the archive cannot serve, but it is indistinguishable from a
+        # sulking 3B model, so keep RRF order and say so.
+        return rows, "model returned empty"
+    # Anything it did not name keeps its RRF order behind what it did.
+    picked += [r for i, r in enumerate(rows) if i not in seen]
+    return picked, "ok"
+
+
 @app.get("/health")
 async def health():
     """Exercise BOTH dependencies. A health check that cannot fail while the
@@ -234,6 +346,7 @@ async def search(
     role: Optional[str] = None,
     days: Optional[int] = Query(None, ge=1, le=3650),
     hybrid: bool = Query(True),
+    rerank_: bool = Query(True, alias="rerank"),
     candidates: int = Query(60, ge=10, le=500),
 ):
     """Hybrid retrieval: dense vector + lexical BM25-ish, fused with RRF.
@@ -282,6 +395,12 @@ async def search(
     params: list = [qvec] if not hybrid else [qvec, ""]
     idx = len(params) + 1
 
+    do_rerank = rerank_ and RERANK_ENABLED
+    # Pull a deeper pool when re-ranking: the whole point is that the right
+    # answer may sit below the RRF cut-off, so handing the model only the
+    # top-`limit` rows would ask it to reorder a set the answer is not in.
+    sql_limit = max(int(limit), RERANK_POOL) if do_rerank else int(limit)
+
     conds = []
     if project:
         conds.append(f"project = ${idx}")
@@ -301,7 +420,7 @@ async def search(
             FROM messages
             WHERE embedding IS NOT NULL{where_extra}
             ORDER BY embedding <=> $1::vector
-            LIMIT {int(limit)}
+            LIMIT {int(sql_limit)}
         """
     else:
         sql = f"""
@@ -336,7 +455,7 @@ async def search(
             FROM fused f
             JOIN messages m ON m.id = f.id
             ORDER BY f.score DESC, m.created_at DESC
-            LIMIT {int(limit)}
+            LIMIT {int(sql_limit)}
         """
 
     async with app.state.pool.acquire() as conn:
@@ -357,11 +476,21 @@ async def search(
         _t_sql = time.perf_counter() - _t1
         _t_probe = _t1 - _t0 - _t_embed
 
+    rank_note = "off"
+    _t_rank = 0.0
+    if do_rerank:
+        _t2 = time.perf_counter()
+        rows, rank_note = await rerank(app.state.http, q, list(rows), int(limit))
+        _t_rank = time.perf_counter() - _t2
+    rows = rows[: int(limit)]
+
     return {
         "query": q,
         "mode": "hybrid" if hybrid else "vector",
         "lex_query": (params[1] if hybrid else None),
-        "timings_ms": {"embed": round(_t_embed*1000), "probe": round(_t_probe*1000), "sql": round(_t_sql*1000)},
+        "rerank": rank_note,
+        "timings_ms": {"embed": round(_t_embed*1000), "probe": round(_t_probe*1000),
+                       "sql": round(_t_sql*1000), "rerank": round(_t_rank*1000)},
         "count": len(rows),
         "results": [
             {
