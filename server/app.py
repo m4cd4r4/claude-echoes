@@ -345,6 +345,7 @@ async def search(
     project: Optional[str] = None,
     role: Optional[str] = None,
     days: Optional[int] = Query(None, ge=1, le=3650),
+    source: Optional[str] = Query(None),
     hybrid: bool = Query(True),
     rerank_: bool = Query(True, alias="rerank"),
     candidates: int = Query(60, ge=10, le=500),
@@ -408,6 +409,9 @@ async def search(
     if role:
         conds.append(f"role = ${idx}")
         params.append(role); idx += 1
+    if source:
+        conds.append(f"source = ${idx}")
+        params.append(source); idx += 1
     if days:
         conds.append(f"created_at > NOW() - INTERVAL '{int(days)} days'")
 
@@ -415,7 +419,7 @@ async def search(
 
     if not hybrid:
         sql = f"""
-            SELECT id, session_id, project, role, content, model, created_at,
+            SELECT id, session_id, project, role, content, model, source, created_at,
                    1 - (embedding <=> $1::vector) AS score
             FROM messages
             WHERE embedding IS NOT NULL{where_extra}
@@ -451,7 +455,7 @@ async def search(
                 FULL OUTER JOIN lex l ON v.id = l.id
             )
             SELECT m.id, m.session_id, m.project, m.role, m.content, m.model,
-                   m.created_at, f.score
+                   m.source, m.created_at, f.score
             FROM fused f
             JOIN messages m ON m.id = f.id
             ORDER BY f.score DESC, m.created_at DESC
@@ -498,6 +502,7 @@ async def search(
                 "session_id": r["session_id"],
                 "project": r["project"],
                 "role": r["role"],
+                "source": r["source"],
                 "content": r["content"],
                 "model": r["model"],
                 "created_at": r["created_at"].isoformat(),

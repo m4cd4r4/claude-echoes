@@ -209,3 +209,54 @@ would close this, and both were deferred.
 
 Worth stating plainly: **a re-ranker reorders what retrieval found. It cannot
 retrieve.**
+
+---
+
+# Gap 1: indexing the OTHER memory layers
+
+The verbatim chat index was one of four layers, and the only one that was
+searchable. Measured: 108,570 chat messages indexed, and **759 dated ledger
+entries not indexed at all** - `changes.jsonl` (444), `client-decisions.jsonl`
+(253), `infra-changelog.jsonl` (62). Those are the entries that record what
+SUPERSEDED what, averaging 1,403 characters of hand-written conclusion.
+
+`scripts/ingest_ledgers.py` indexes them with a `source` column, their own real
+timestamps, and `role='note'` - not `user` or `assistant`, because mislabelling
+them would corrupt the `--role` filter over real conversation. 759 rows in 68s.
+
+## The result is a genuine trade, not a win
+
+| | score | MRR | notes |
+|---|---|---|---|
+| chat only | 6/7 | **0.857** | `curl_cffi` unreachable at candidates=500 |
+| + 759 ledger rows | 6/7 | **0.750** | `curl_cffi` now PASSES; AzurePrep lost |
+
+**The reach gap closed.** `what fixes a scraper getting 429 on every request`
+was previously absent from the candidate pool at any depth - no re-ranker could
+have found it. It now returns at rank 3-4, because a ledger entry describes it
+in words closer to the question. That is a capability the chat corpus did not
+have.
+
+**And a case regressed.** `how many certifications and questions does AzurePrep
+have` fell from rank 1 to absent. It is now at **index 63** of the fused pool,
+outside the 24 the re-ranker sees.
+
+## The cause is worth more than the fix
+
+The lexical query is unchanged (`certifications & questions & azureprep`, 521
+matching rows). What changed is what else matches it: **10 ledger rows now hit
+that query, and 3 of them were written TODAY, logging this very session's work
+on AzurePrep's figures.**
+
+So: an append-only log of your own activity becomes a competing document set for
+exactly the topics you have been working on, and it outranks the original
+material because it is denser and more recent. **A memory system that records
+its own work pollutes retrieval for the subjects it recorded.** Nothing in the
+literature reviewed today names this; it falls out of having both layers in one
+index.
+
+Deliberately NOT tuned. The same discipline as the document-frequency
+experiment applies - seven cases is too small to fit a source-weighting rule to,
+and the obvious levers (cap ledger rows per result page, down-weight `source` in
+the RRF sum, widen the re-rank pool past 63) each trade the reach gain back.
+Recorded, and left for a decision on a wider eval.
