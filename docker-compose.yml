@@ -21,6 +21,13 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: echoes-ollama
+    environment:
+      # Keep the embedding model resident. Measured 2026-08-29: the default let
+      # it expire about two minutes after the last request, and the reload cost
+      # ~50 SECONDS on the next query - so the first question of any session
+      # looked broken while every follow-up returned in ~200ms. The model is
+      # 376 MB; -1 means never unload.
+      OLLAMA_KEEP_ALIVE: "-1"
     volumes:
       - ./data/ollama:/root/.ollama
     ports:

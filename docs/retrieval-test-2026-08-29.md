@@ -117,8 +117,29 @@ is the case a real re-ranker would catch, and the server has none.
   86.4% figure comes from `benchmarks/run_longmemeval.py`, which has temporal
   re-ranking and an LLM re-ranker; `/search` has neither.
 
-## Operational note
+## The cold-load, fixed
 
-A cold Ollama model load costs about **50 seconds** on the first query after
-idle. It is not a code defect, but it makes the first question of a session
-feel broken. Worth a `keep_alive` setting before anyone else uses this.
+`ollama ps` reported the embedding model expiring **"2 minutes from now"**, so
+any question after a short pause paid a **~50 second** reload while every
+follow-up answered in ~200ms. The first question of a session looked broken and
+nothing in the logs said why.
+
+`OLLAMA_KEEP_ALIVE: "-1"` on the container, plus `keep_alive: -1` on each
+request so it also holds against an ollama the user started themselves.
+`ollama ps` now reads **`UNTIL  Forever`** for 376 MB resident.
+
+Worth recording: the new `/health` caught this fix landing. It returned
+**503 `embeddings: down`** in the seconds between container start and the model
+finishing its load - which is the first time that endpoint has ever been able
+to report a real fault, and is exactly the behaviour the old `ok:true`-always
+version could not produce.
+
+## Final numbers, warm
+
+| | |
+|---|---|
+| Score | **6/7 at top-5** |
+| Slowest query | **731ms** |
+| Median | ~130ms |
+| Embed | 39-71ms |
+| Probe | 3-40ms (was up to 139,031ms) |

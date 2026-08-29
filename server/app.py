@@ -76,7 +76,12 @@ async def embed_text(http: aiohttp.ClientSession, text: str) -> Optional[str]:
     try:
         async with http.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json={"model": OLLAMA_MODEL, "prompt": (text or "")[:MAX_CONTENT_CHARS]},
+            # keep_alive is sent per request as well as set on the container,
+            # so the model stays resident against a stock ollama the user
+            # started themselves. See docker-compose.yml for the measurement.
+            json={"model": OLLAMA_MODEL,
+                  "prompt": (text or "")[:MAX_CONTENT_CHARS],
+                  "keep_alive": -1},
         ) as r:
             if r.status != 200:
                 return None
