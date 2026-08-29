@@ -12,6 +12,8 @@ Every prompt, every response, every project — searchable by meaning, across ev
 
 **Benchmarked honestly.** **86.4% on [LongMemEval](https://github.com/xiaowu0162/LongMemEval)** (ICLR 2025) with Sonnet 4.6 - pgvector cosine + BM25 RRF hybrid + temporal re-ranking + LLM re-ranker. **100% on single-session-user retrieval** (70/70). Full per-category breakdown, raw outputs, and reproduction steps in [benchmarks/](benchmarks/). No hardcoded answer patterns. No invented terminology. No cherry-picking.
 
+**What the SERVER actually runs is less than what that number measures.** The 86.4% pipeline lives in [benchmarks/run_longmemeval.py](benchmarks/run_longmemeval.py); the `/search` endpoint runs pgvector cosine and Postgres full-text fused with RRF, and **no temporal re-ranking and no LLM re-ranker**. Treat 86.4% as the ceiling of the approach, not the score of the service you get by running `docker compose up`. What the service does score is in [docs/retrieval-test-2026-08-29.md](docs/retrieval-test-2026-08-29.md): **6/7 at top-5** on a graded set of natural-language questions whose answers were confirmed present in the corpus by SQL first, run by [scripts/eval_retrieval.mjs](scripts/eval_retrieval.mjs) against a real 108,570-message archive.
+
 ---
 
 ## What it does

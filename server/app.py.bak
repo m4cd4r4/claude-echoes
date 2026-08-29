@@ -13,8 +13,6 @@ in 5 minutes, something has gone wrong.
 from __future__ import annotations
 
 import os
-import time
-import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -90,99 +88,11 @@ async def embed_text(http: aiohttp.ClientSession, text: str) -> Optional[str]:
 
 # --- endpoints ------------------------------------------------------------
 
-
-# websearch_to_tsquery ANDs every content word, so a natural-language QUESTION
-# ("how many certifications does AzurePrep have") narrows the conjunction until
-# it matches almost nothing - measured 2026-08-29: 5 rows for the question form
-# against 511 for the same query stripped to its content words. The hybrid then
-# silently degraded to vector-only, which is weakest on exactly the "which
-# number was it" lookups this tool exists for.
-#
-# So we keep AND first (it is precise when it fires) and fall back to OR when it
-# returns almost nothing. ts_rank still rewards documents carrying MORE of the
-# terms, so the OR arm degrades gracefully rather than flooding.
-_STOP = {
-    "a","an","and","are","as","at","be","but","by","did","do","does","for","from",
-    "get","give","had","has","have","how","i","if","in","into","is","it","its","many",
-    "me","much","my","of","on","or","our","should","so","tell","that","the","their",
-    "them","then","there","these","this","to","was","we","were","what","when","where",
-    "which","who","why","will","with","would","you","your","actually","really","just",
-}
-DF_CAP = 2000  # capped document frequency: only the ordering matters  # below this many AND hits, retry the lexical arm with OR
-
-
-def content_words(q: str) -> list:
-    """Query words with stopwords and question words dropped, deduped, and
-    sanitised to what to_tsquery accepts."""
-    seen, out = set(), []
-    for w in re.findall(r"[A-Za-z0-9_]+", q.lower()):
-        if len(w) < 2 or w in _STOP or w in seen:
-            continue
-        seen.add(w)
-        out.append(w)
-    return out
-
-
-async def pick_lex_query(conn, q: str, where_sql: str, where_args: list) -> Optional[str]:
-    """Choose the lexical tsquery by PROGRESSIVE RELAXATION, in ONE statement.
-
-    Measured on 108,570 messages, 2026-08-29:
-
-    1. websearch_to_tsquery ANDs every content word, so the raw question
-       "how many certifications and questions does AzurePrep have" matched
-       5 rows and missed the answer. Stripped of stopwords it matched 511,
-       answer included. Dropping question words is free precision.
-    2. A pure OR fallback matched 29,324 rows and cost 29-46 seconds a query -
-       ts_rank has no IDF term, so a wide OR buries the rare word. Rejected.
-    3. Relaxing AND from all content words downward is precise AND cheap - but
-       it MUST be one statement. Running the tiers as a LOOP of prepared
-       probes was measured at 71-139 SECONDS: asyncpg prepares each probe, and
-       after a few executions Postgres switches to a GENERIC plan that cannot
-       use the tsquery's selectivity, falls back to a sequential scan, and
-       recomputes to_tsvector over every row. The same probes under EXPLAIN
-       ANALYZE took 2ms each, which is why the loop looked safe.
-
-    Longest words first, as a cheap proxy for rare. ORDERING BY REAL DOCUMENT
-    FREQUENCY WAS TRIED AND MEASURED WORSE: 5/7 against 6/7 on the graded set
-    in scripts/eval_retrieval.mjs. Rarest-first builds an over-specific
-    conjunction that matches SOMETHING early, and the loop stops at the first
-    non-empty tier, so a spurious rare-term match beats the right answer. It
-    fixed the one case it was designed for ("429") and broke a different one.
-    Seven cases is too small to tune on, so the simpler rule stays.
-    """
-    words = content_words(q)
-    if not words:
-        return None
-    ranked = sorted(words, key=len, reverse=True)
-    tiers = [" & ".join(ranked[:k]) for k in range(len(ranked), 1, -1)]
-    sql = (
-        "SELECT t.q FROM unnest($1::text[]) WITH ORDINALITY AS t(q, ord) "
-        "WHERE EXISTS (SELECT 1 FROM messages "
-        "              WHERE to_tsvector('english', content) "
-        f"                    @@ to_tsquery('english', t.q){where_sql}) "
-        "ORDER BY t.ord LIMIT 1"
-    )
-    try:
-        return await conn.fetchval(sql, tiers, *where_args)
-    except Exception:
-        return None
-
 @app.get("/health")
 async def health():
-    """Exercise BOTH dependencies. A health check that cannot fail while the
-    service is down is decoration - this one returned ok:true through an outage
-    on 2026-08-29 because it only read a model name out of config."""
-    db = "down"
     async with app.state.pool.acquire() as conn:
-        if await conn.fetchval("SELECT 1") == 1:
-            db = "up"
-    embed_ok = await embed_text(app.state.http, "health") is not None
-    ok = db == "up" and embed_ok
-    body = {"ok": ok, "db": db, "embeddings": "up" if embed_ok else "down",
-            "model": OLLAMA_MODEL}
-    if not ok:
-        raise HTTPException(503, body)
-    return body
+        await conn.fetchval("SELECT 1")
+    return {"ok": True, "db": "up", "model": OLLAMA_MODEL}
 
 @app.post("/message")
 async def write_message(msg: MessageIn):
@@ -253,9 +163,7 @@ async def search(
     hybrid=false restores the old pure-vector path, so the two are comparable on
     the same data without redeploying.
     """
-    _t0 = time.perf_counter()
     qvec = await embed_text(app.state.http, q)
-    _t_embed = time.perf_counter() - _t0
     if qvec is None:
         raise HTTPException(503, "embedding service unavailable")
 
@@ -271,10 +179,7 @@ async def search(
     # fixed "start filters at $3" produced a 500 on every hybrid=false call
     # while hybrid=true worked, which is exactly the kind of break that hides
     # behind a default value.
-    # $2 is the chosen lexical tsquery, resolved below against the same filters
-    # the main query uses - a probe that ignored the filters could pick a query
-    # whose only matches are then filtered away, leaving the lexical arm empty.
-    params: list = [qvec] if not hybrid else [qvec, ""]
+    params: list = [qvec] if not hybrid else [qvec, q]
     idx = len(params) + 1
 
     conds = []
@@ -310,13 +215,13 @@ async def search(
             lex AS (
                 SELECT id, ROW_NUMBER() OVER (
                            ORDER BY ts_rank(to_tsvector('english', content),
-                                            to_tsquery('english', $2)) DESC
+                                            websearch_to_tsquery('english', $2)) DESC
                        ) AS rnk
                 FROM messages
                 WHERE to_tsvector('english', content)
-                      @@ to_tsquery('english', $2){where_extra}
+                      @@ websearch_to_tsquery('english', $2){where_extra}
                 ORDER BY ts_rank(to_tsvector('english', content),
-                                 to_tsquery('english', $2)) DESC
+                                 websearch_to_tsquery('english', $2)) DESC
                 LIMIT {int(candidates)}
             ),
             fused AS (
@@ -335,28 +240,11 @@ async def search(
         """
 
     async with app.state.pool.acquire() as conn:
-        if hybrid:
-            # Filter placeholders start at $3 in the main query; the probe only
-            # binds them, so renumber them to $2.. for its own statement.
-            probe_where = where_extra
-            for n in range(idx - 1, 2, -1):
-                probe_where = probe_where.replace(f"${n}", f"${n - 1}")
-            lexq = await pick_lex_query(conn, q, probe_where, params[2:])
-            if lexq is None:
-                # No lexical arm at all - RRF degrades to the vector ranking,
-                # which is the correct behaviour, not an error.
-                lexq = "zzzz_no_lexical_match_zzzz"
-            params[1] = lexq
-        _t1 = time.perf_counter()
         rows = await conn.fetch(sql, *params)
-        _t_sql = time.perf_counter() - _t1
-        _t_probe = _t1 - _t0 - _t_embed
 
     return {
         "query": q,
         "mode": "hybrid" if hybrid else "vector",
-        "lex_query": (params[1] if hybrid else None),
-        "timings_ms": {"embed": round(_t_embed*1000), "probe": round(_t_probe*1000), "sql": round(_t_sql*1000)},
         "count": len(rows),
         "results": [
             {

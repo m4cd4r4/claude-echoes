@@ -303,6 +303,23 @@ Return format: [[index, score], [index, score], ...]"""
                   file=sys.stderr, flush=True)
             return hits[:k]
 
+    def rerank_with_crossencoder(self, hits: list[tuple[float, Turn]], question: str,
+                                 k: int = TOP_K) -> list[tuple[float, Turn]]:
+        """
+        Cross-encoder re-ranker using sentence-transformers.
+        Purpose-built for relevance scoring - no JSON parsing, no LLM calls.
+        Runs on CPU, ~50ms per query. Free.
+        """
+        if not hits or len(hits) <= k:
+            return hits
+        if not hasattr(self, '_cross_encoder'):
+            from sentence_transformers import CrossEncoder
+            self._cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        pairs = [(question, turn.content[:512]) for _, turn in hits]
+        scores = self._cross_encoder.predict(pairs)
+        scored = sorted(zip(scores, hits), key=lambda x: -x[0])
+        return [(float(ce_score), turn) for ce_score, (_, turn) in scored[:k]]
+
     def rerank_with_ollama(self, hits: list[tuple[float, Turn]], question: str,
                            model: str = "qwen2.5:7b",
                            k: int = TOP_K) -> list[tuple[float, Turn]]:
@@ -745,6 +762,145 @@ def flatten_turns(dataset: list[dict]) -> list[Turn]:
     print(f"flattened to {len(turns):,} turns")
     return turns
 
+
+def flatten_windows(dataset: list[dict], window_size: int = 3) -> list[Turn]:
+    """
+    Option B: Create sliding windows of consecutive messages.
+    Each window concatenates `window_size` consecutive turns from the same session.
+    This captures multi-turn context ("I asked X" + "you said Y" + "I confirmed Z")
+    that single-message embeddings miss.
+    """
+    windows: list[Turn] = []
+    for q in dataset:
+        qid = q["question_id"]
+        sessions = q.get("haystack_sessions", [])
+        session_ids = q.get("haystack_session_ids", [])
+        dates = q.get("haystack_dates", [])
+        for s_idx, session in enumerate(sessions):
+            sid = session_ids[s_idx] if s_idx < len(session_ids) else f"{qid}-s{s_idx}"
+            date = dates[s_idx] if s_idx < len(dates) else None
+            for start in range(len(session)):
+                end = min(start + window_size, len(session))
+                parts = []
+                for t_idx in range(start, end):
+                    turn = session[t_idx]
+                    parts.append(f"{turn.get('role', 'user')}: {turn.get('content', '')}")
+                windows.append(Turn(
+                    question_id=qid,
+                    session_id=sid,
+                    turn_idx=start,
+                    role="window",
+                    content="\n".join(parts)[:MAX_CONTENT_CHARS],
+                    timestamp=date,
+                ))
+    print(f"created {len(windows):,} windows (size={window_size})")
+    return windows
+
+
+def flatten_sessions(dataset: list[dict]) -> list[Turn]:
+    """
+    Option A: Create one entry per session with all messages concatenated.
+    Captures the overall topic of each session for coarse-grained retrieval.
+    Two-stage search: find relevant sessions first, then drill into messages.
+    """
+    session_turns: list[Turn] = []
+    for q in dataset:
+        qid = q["question_id"]
+        sessions = q.get("haystack_sessions", [])
+        session_ids = q.get("haystack_session_ids", [])
+        dates = q.get("haystack_dates", [])
+        for s_idx, session in enumerate(sessions):
+            sid = session_ids[s_idx] if s_idx < len(session_ids) else f"{qid}-s{s_idx}"
+            date = dates[s_idx] if s_idx < len(dates) else None
+            parts = []
+            for turn in session:
+                parts.append(f"{turn.get('role', 'user')}: {turn.get('content', '')}")
+            session_turns.append(Turn(
+                question_id=qid,
+                session_id=sid,
+                turn_idx=0,
+                role="session_summary",
+                content="\n".join(parts)[:MAX_CONTENT_CHARS],
+                timestamp=date,
+            ))
+    print(f"created {len(session_turns):,} session embeddings")
+    return session_turns
+
+
+class MultiIndexRetriever:
+    """
+    Combines results from multiple retrieval indices:
+      - message-level (existing)
+      - window-level (Option B)
+      - session-level (Option A, for identifying relevant sessions)
+
+    For each query, searches all indices, deduplicates by content overlap,
+    and returns merged top-k results.
+    """
+    def __init__(self, msg_retriever: 'EchoesRetriever',
+                 win_retriever: Optional['EchoesRetriever'] = None,
+                 sess_retriever: Optional['EchoesRetriever'] = None,
+                 msg_turns: Optional[list[Turn]] = None):
+        self.msg = msg_retriever
+        self.win = win_retriever
+        self.sess = sess_retriever
+        self.msg_turns = msg_turns  # needed for session-guided drill-down
+
+    def search_multi(self, qid: str, query_text: str, query_vec: np.ndarray,
+                     k: int = TOP_K, question_date: str = None,
+                     hybrid: bool = False, temporal: bool = False,
+                     temporal_weight: float = 0.15) -> list[tuple[float, Turn]]:
+        """Search all indices and merge results."""
+        # 1. Primary: message-level search
+        if temporal and hybrid:
+            msg_hits = self.msg.search_hybrid_temporal(
+                qid, query_text, query_vec, question_date=question_date or "",
+                k=k * 2, temporal_weight=temporal_weight)
+        elif hybrid:
+            msg_hits = self.msg.search_hybrid(qid, query_text, query_vec, k=k * 2)
+        else:
+            msg_hits = self.msg.search(qid, query_vec, k=k * 2)
+
+        # 2. Window-level search (Option B)
+        win_hits = []
+        if self.win is not None:
+            if hybrid:
+                win_hits = self.win.search_hybrid(qid, query_text, query_vec, k=k)
+            else:
+                win_hits = self.win.search(qid, query_vec, k=k)
+
+        # 3. Session-guided drill-down (Option A)
+        sess_hits = []
+        if self.sess is not None and self.msg_turns is not None:
+            # Find top-3 relevant sessions
+            sess_results = self.sess.search(qid, query_vec, k=3)
+            relevant_sids = {t.session_id for _, t in sess_results}
+            # Now search messages but only from those sessions
+            # (boost messages from relevant sessions)
+            for score, turn in msg_hits:
+                if turn.session_id in relevant_sids:
+                    sess_hits.append((score * 1.2, turn))  # 20% boost
+
+        # Merge all hits, deduplicate by content prefix
+        seen = set()
+        merged = []
+        for score, turn in sorted(
+            msg_hits + win_hits + sess_hits,
+            key=lambda x: -x[0]
+        ):
+            # For windows, we want the individual messages from the window
+            key = turn.content[:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            # Skip window-type turns in final output (use for retrieval signal only)
+            if turn.role in ("window", "session_summary"):
+                continue
+            merged.append((score, turn))
+
+        return merged[:k]
+
+
 # ============================================================
 # Answer generation
 # ============================================================
@@ -901,6 +1057,16 @@ def main():
                     help="how many candidates to retrieve before re-ranking")
     ap.add_argument("--smart-temporal", action="store_true",
                     help="use LLM to extract temporal structure from questions")
+    ap.add_argument("--retrieval-only", action="store_true",
+                    help="skip answering, only save retrieved hits (for measuring retrieval quality)")
+    ap.add_argument("--windows", action="store_true",
+                    help="Option B: add sliding-window embeddings for multi-turn context")
+    ap.add_argument("--window-size", type=int, default=3,
+                    help="number of consecutive turns per window (default 3)")
+    ap.add_argument("--sessions", action="store_true",
+                    help="Option A: add session-level embeddings for coarse retrieval")
+    ap.add_argument("--crossencoder-rerank", action="store_true",
+                    help="use cross-encoder model for re-ranking (free, local, replaces --rerank)")
     ap.add_argument("--ollama-answer", action="store_true",
                     help="use local Ollama model for answering (free, for iteration)")
     ap.add_argument("--ollama-answer-model", default="qwen2.5:7b",
@@ -951,6 +1117,64 @@ def main():
         return
 
     retriever = EchoesRetriever(turns, emb)
+
+    # --- Option B: window embeddings ---
+    win_retriever = None
+    if args.windows:
+        windows = flatten_windows(full_dataset, window_size=args.window_size)
+        win_cache = Path(args.cache_embeddings).parent / f"win{args.window_size}_embeddings.npz"
+        win_existing = None
+        if win_cache.exists():
+            try:
+                with np.load(win_cache) as cached:
+                    arr = cached["emb"]
+                    if arr.shape == (len(windows), EMBED_DIM):
+                        win_existing = arr.copy()
+                        print(f"loaded cached window embeddings from {win_cache}")
+            except Exception:
+                pass
+        if win_existing is not None:
+            win_emb = win_existing
+        else:
+            print(f"embedding {len(windows):,} windows...")
+            win_texts = [w.content for w in windows]
+            win_emb = embed_many(win_texts, workers=EMBED_WORKERS,
+                                checkpoint_path=win_cache, existing=None)
+            np.savez_compressed(win_cache, emb=win_emb)
+            print(f"saved window embeddings to {win_cache}")
+        win_retriever = EchoesRetriever(windows, win_emb)
+
+    # --- Option A: session embeddings ---
+    sess_retriever = None
+    if args.sessions:
+        sess_turns = flatten_sessions(full_dataset)
+        sess_cache = Path(args.cache_embeddings).parent / "sess_embeddings.npz"
+        sess_existing = None
+        if sess_cache.exists():
+            try:
+                with np.load(sess_cache) as cached:
+                    arr = cached["emb"]
+                    if arr.shape == (len(sess_turns), EMBED_DIM):
+                        sess_existing = arr.copy()
+                        print(f"loaded cached session embeddings from {sess_cache}")
+            except Exception:
+                pass
+        if sess_existing is not None:
+            sess_emb = sess_existing
+        else:
+            print(f"embedding {len(sess_turns):,} sessions...")
+            sess_texts = [s.content for s in sess_turns]
+            sess_emb = embed_many(sess_texts, workers=EMBED_WORKERS,
+                                  checkpoint_path=sess_cache, existing=None)
+            np.savez_compressed(sess_cache, emb=sess_emb)
+            print(f"saved session embeddings to {sess_cache}")
+        sess_retriever = EchoesRetriever(sess_turns, sess_emb)
+
+    # Build multi-index retriever if any extra indices are present
+    multi_retriever = None
+    if win_retriever or sess_retriever:
+        multi_retriever = MultiIndexRetriever(
+            retriever, win_retriever, sess_retriever, msg_turns=turns)
 
     # --- Phase B: retrieve + answer ---
     if not args.out:
@@ -1031,6 +1255,19 @@ def main():
             use_chrono = False
             system = ANSWER_SYSTEM
 
+        # Multi-index: merge results from window and session indices
+        if multi_retriever is not None:
+            multi_hits = multi_retriever.search_multi(
+                qid, qtxt, query_vec, k=retrieve_k,
+                question_date=qdate, hybrid=args.hybrid_search,
+                temporal=use_temporal, temporal_weight=args.temporal_weight)
+            # Merge multi-index hits with primary hits
+            seen_contents = {t.content[:80] for _, t in hits}
+            for score, turn in multi_hits:
+                if turn.content[:80] not in seen_contents:
+                    hits.append((score * 0.95, turn))  # slight penalty for secondary index
+                    seen_contents.add(turn.content[:80])
+
         # Smart temporal: merge results from alternative search queries
         if extra_queries:
             seen_contents = {t.content[:100] for _, t in hits}
@@ -1051,8 +1288,11 @@ def main():
                         hits.append((score * 0.9, turn))  # slight penalty for alt-query
                         seen_contents.add(turn.content[:100])
 
-        # LLM re-ranker: narrow down wide retrieval to effective_k
-        if args.rerank and len(hits) > effective_k:
+        # Re-ranker: narrow down wide retrieval to effective_k
+        if args.crossencoder_rerank and len(hits) > effective_k:
+            hits = retriever.rerank_with_crossencoder(
+                hits, qtxt, k=effective_k)
+        elif args.rerank and len(hits) > effective_k:
             if args.ollama_answer:
                 hits = retriever.rerank_with_ollama(
                     hits, qtxt, args.ollama_answer_model, k=effective_k)
@@ -1061,17 +1301,20 @@ def main():
                     hits, qtxt, client, args.rerank_model, k=effective_k)
 
         hits_text = format_hits(hits[:effective_k], chronological=use_chrono)
-        try:
-            if args.ollama_answer:
-                hyp = answer_with_ollama(
-                    args.ollama_answer_model, qtxt, hits_text, qdate,
-                    system_prompt=system, chronological=use_chrono)
-            else:
-                hyp = answer_with_claude(client, args.answer_model, qtxt, hits_text,
-                                         qdate, thinking_budget=args.thinking_budget,
-                                         system_prompt=system, chronological=use_chrono)
-        except Exception as e:
-            return {"question_id": qid, "hypothesis": "", "error": str(e)}
+        if args.retrieval_only:
+            hyp = ""
+        else:
+            try:
+                if args.ollama_answer:
+                    hyp = answer_with_ollama(
+                        args.ollama_answer_model, qtxt, hits_text, qdate,
+                        system_prompt=system, chronological=use_chrono)
+                else:
+                    hyp = answer_with_claude(client, args.answer_model, qtxt, hits_text,
+                                             qdate, thinking_budget=args.thinking_budget,
+                                             system_prompt=system, chronological=use_chrono)
+            except Exception as e:
+                return {"question_id": qid, "hypothesis": "", "error": str(e)}
         return {
             "question_id": qid,
             "question_type": qtype,
