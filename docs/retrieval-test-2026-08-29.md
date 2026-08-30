@@ -9,7 +9,7 @@ Roles: 66,531 user / 42,039 assistant.
 | Query | Verdict |
 |---|---|
 | "why was ntfy retired and what replaced it" | HIT at rank 2 - the 2026-07-20 approval, the correct date |
-| "decision to exclude Wix from site refresh" | HIT at rank 1 AND 2 - the decision, plus **Macdara's own words giving the reason** |
+| "decision to exclude a platform from a service" | HIT at rank 1 AND 2 - the decision, plus **the user's own words giving the reason** |
 | `days=7` filter | Correct - narrows to 27 Aug only |
 
 `created_at` preservation works. That was the whole reason for replacing
@@ -20,20 +20,20 @@ than assumed.
 
 | Query form | Rows the lexical arm can see |
 |---|---|
-| `how many certifications and questions does AzurePrep actually have` | **5** |
-| `AzurePrep certifications questions` | **511** |
-| `certification \| question \| azureprep` (OR) | 29,324 |
+| `how many certifications and questions does ProjectA actually have` | **5** |
+| `ProjectA certifications questions` | **511** |
+| `certification \| question \| projecta` (OR) | 29,324 |
 
 `websearch_to_tsquery` **ANDs every content word**. Add "how many", "actually",
 "have" and the conjunction excludes the answer. The hybrid then silently
 degrades to vector-only, and the vector arm is weak on "which number was it" -
 so the query returned three irrelevant results while four messages in the
-corpus state `32 certifications, 9,637 questions, 9,615 flashcards`.
+corpus state `32 certifications, N questions, M flashcards`.
 
 Proven not to be a recall-depth problem: `candidates=500` returns the same
 three misses as `candidates=60`. It is ranking, not reach.
 
-Rephrasing to `AzurePrep 9,637 questions 9,615 flashcards` hits at rank 1 -
+Rephrasing to `ProjectA N questions M flashcards` hits at rank 1 -
 which is useless, because knowing the number is the thing you were asking for.
 
 **This is the product's core use case failing.** "When did we decide X, and
@@ -150,7 +150,7 @@ version could not produce.
 
 Added because retrieval matches on shared vocabulary, and a question sometimes
 shares none with its answer. The case that forced it: **"what did we decide
-about the ERF hero video"** returned the right *sessions* but never the
+about the a client hero video"** returned the right *sessions* but never the
 decision, because the decision says "triptych" and "IMG_5506" and the question
 says neither. No amount of lexical relaxation reaches words that are absent.
 
@@ -171,8 +171,8 @@ only "6/7" would have made this change look like a waste of an afternoon.
 ## Model size is not a detail: 3B measured WORSE than no re-ranker
 
 `qwen2.5:3b-instruct` scored **5/7**, below the 6/7 RRF baseline. It fixed the
-ERF case dramatically and *demoted* cases RRF already had right - Lighthouse
-1->5, Turbopack 1->4, and it lost AzurePrep entirely. A weak judge is worse
+a client case dramatically and *demoted* cases RRF already had right - Lighthouse
+1->5, Turbopack 1->4, and it lost ProjectA entirely. A weak judge is worse
 than no judge, because it overrides a ranking that was already correct.
 
 `qwen2.5:7b-instruct` fixed all of it. 4.7 GB, ~400-1700ms a query on the
@@ -229,7 +229,7 @@ them would corrupt the `--role` filter over real conversation. 759 rows in 68s.
 | | score | MRR | notes |
 |---|---|---|---|
 | chat only | 6/7 | **0.857** | `curl_cffi` unreachable at candidates=500 |
-| + 759 ledger rows | 6/7 | **0.750** | `curl_cffi` now PASSES; AzurePrep lost |
+| + 759 ledger rows | 6/7 | **0.750** | `curl_cffi` now PASSES; ProjectA lost |
 
 **The reach gap closed.** `what fixes a scraper getting 429 on every request`
 was previously absent from the candidate pool at any depth - no re-ranker could
@@ -237,16 +237,16 @@ have found it. It now returns at rank 3-4, because a ledger entry describes it
 in words closer to the question. That is a capability the chat corpus did not
 have.
 
-**And a case regressed.** `how many certifications and questions does AzurePrep
+**And a case regressed.** `how many certifications and questions does ProjectA
 have` fell from rank 1 to absent. It is now at **index 63** of the fused pool,
 outside the 24 the re-ranker sees.
 
 ## The cause is worth more than the fix
 
-The lexical query is unchanged (`certifications & questions & azureprep`, 521
+The lexical query is unchanged (`certifications & questions & projecta`, 521
 matching rows). What changed is what else matches it: **10 ledger rows now hit
 that query, and 3 of them were written TODAY, logging this very session's work
-on AzurePrep's figures.**
+on ProjectA's figures.**
 
 So: an append-only log of your own activity becomes a competing document set for
 exactly the topics you have been working on, and it outranks the original
