@@ -49,6 +49,12 @@ for (const c of CASES) {
   const params = new URLSearchParams({ q: c.q, limit: String(K) });
   if (!RERANK) params.set('rerank', 'false');
   if (c.days) params.set('days', String(c.days));
+  // The query text for a gold-bearing case IS the user's own turn, and that row
+  // is in the index: it embeds at cosine 1.0 and carries every lexical term, so
+  // it takes RRF rank 1 in every such case and gold can never place better than
+  // 2. Restricting to assistant rows removes the question's own row from the
+  // pool. Abstention cases have no gold and must stay unrestricted.
+  if ((c.gold_ids || []).length) params.set('role', 'assistant');
 
   const t0 = Date.now();
   const { rows, err } = await search(params);
