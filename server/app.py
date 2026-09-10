@@ -18,6 +18,7 @@ import os
 import time
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 import aiohttp
@@ -64,6 +65,12 @@ class MessageIn(BaseModel):
     role: str                    # "user" | "assistant"
     content: str
     model: Optional[str] = None
+    # When the turn actually happened. Omit and the column default now() applies,
+    # which is only correct for a live write. A queued turn drained after an
+    # outage, or an imported transcript, MUST send the real time or every
+    # `days`-filtered search lies about it - and because content_hash is
+    # generated from created_at, a wrong time also defeats the dedupe index.
+    created_at: Optional[datetime] = None
 
 class SearchHit(BaseModel):
     id: int
@@ -308,27 +315,37 @@ async def write_message(msg: MessageIn):
 
     emb = await embed_text(app.state.http, msg.content)
 
+    # COALESCE so an omitted created_at still takes the column default. Passing
+    # NULL explicitly would violate NOT NULL rather than fall back.
     async with app.state.pool.acquire() as conn:
         if emb is not None:
             row = await conn.fetchrow(
                 """
-                INSERT INTO messages (session_id, project, machine, role, content, model, embedding)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::vector)
+                INSERT INTO messages (session_id, project, machine, role, content, model, embedding, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::vector, COALESCE($8, now()))
+                ON CONFLICT (content_hash) DO NOTHING
                 RETURNING id, created_at
                 """,
                 msg.session_id, msg.project, msg.machine, msg.role,
-                msg.content, msg.model, emb,
+                msg.content, msg.model, emb, msg.created_at,
             )
         else:
             row = await conn.fetchrow(
                 """
-                INSERT INTO messages (session_id, project, machine, role, content, model)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO messages (session_id, project, machine, role, content, model, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+                ON CONFLICT (content_hash) DO NOTHING
                 RETURNING id, created_at
                 """,
                 msg.session_id, msg.project, msg.machine, msg.role,
-                msg.content, msg.model,
+                msg.content, msg.model, msg.created_at,
             )
+
+    # DO NOTHING returns no row. That is a successful no-op, not a failure - a
+    # queue drain that overlaps an earlier one must not look like an error, or
+    # the client retries forever.
+    if row is None:
+        return {"duplicate": True, "embedded": emb is not None}
 
     return {
         "id": row["id"],
