@@ -57,14 +57,25 @@ RERANK_SNIPPET = 420   # chars of each candidate the model sees
 RERANK_TIMEOUT = 60
 
 # Recency tie-break. See the sizing note in /search before changing these.
+# HNSW recall. ef_search below the requested candidate count silently truncates
+# the search; see the measurement in /search. 4x with a floor of 200 keeps recall
+# high at the default candidates=60 without making a deep pool pathological.
+EF_SEARCH_FACTOR = int(os.environ.get("ECHOES_EF_SEARCH_FACTOR", "4"))
+EF_SEARCH_MIN    = int(os.environ.get("ECHOES_EF_SEARCH_MIN", "200"))
+
 RECENCY_WEIGHT = float(os.environ.get("ECHOES_RECENCY_WEIGHT", "0.0008"))
 RECENCY_HALFLIFE_DAYS = float(os.environ.get("ECHOES_RECENCY_HALFLIFE_DAYS", "45"))
 
 # Abstention. Needs the same local model as the re-ranker, so it is GPU-gated
 # alongside it and off in the base stack.
 ABSTAIN_ENABLED = os.environ.get("ECHOES_ABSTAIN", "0") not in ("0", "", "false")
-ABSTAIN_ROWS = 5      # how many of the final rows the judge is shown
-ABSTAIN_SNIPPET = 700 # chars each; larger than the re-ranker's, see judge_abstain
+# The judge sees the CANDIDATE POOL, not the final page. Judging the top 5 asks
+# it to rule on rows the re-ranker has not sorted yet: measured 2026-09-10, a
+# correct answer sat at RRF rank 17, was invisible to a top-5 judge, and the
+# query abstained on a question the corpus could answer. 12x500 keeps the prompt
+# inside the 4096-token context that 420x24 would overflow.
+ABSTAIN_ROWS = 12
+ABSTAIN_SNIPPET = 500
 ABSTAIN_TIMEOUT = 45
 
 # --- models ---------------------------------------------------------------
@@ -613,6 +624,36 @@ async def search(
         """
 
     async with app.state.pool.acquire() as conn:
+        # HNSW is an APPROXIMATE index and its default ef_search is 40. Asking
+        # it for `candidates` rows while letting it explore only 40 is
+        # incoherent, and it does not fail loudly - the graph search simply
+        # stops early and the rows it never reached are indistinguishable from
+        # rows that do not exist.
+        #
+        # Measured 2026-09-10 on 116,540 rows, for a question whose answer sits
+        # at TRUE rank 16 of a 60-candidate request:
+        #
+        #   ef_search=40   ->  MISSED entirely
+        #   ef_search=100  ->  rank 16
+        #   ef_search=400  ->  rank 16
+        #
+        # This was the single cause of every "the answer is in the corpus and
+        # /search cannot find it" failure, and it is invisible from inside: the
+        # measurements are stable, repeatable and wrong, which reads exactly
+        # like a weak embedding model or a ranking problem. Two of those were
+        # hypothesised and neither was the cause.
+        #
+        # ef_search must exceed the number of candidates requested, with headroom
+        # for recall.
+        #
+        # Plain SET, not SET LOCAL: SET LOCAL only applies inside an explicit
+        # transaction, and this block runs in autocommit - it would silently do
+        # nothing, which is the same class of quiet failure as the bug itself.
+        # The value is session-scoped on a pooled connection, which is harmless
+        # here because every /search sets it again from its own `candidates`.
+        await conn.execute(
+            f"SET hnsw.ef_search = {max(int(candidates) * EF_SEARCH_FACTOR, EF_SEARCH_MIN)}")
+
         if hybrid:
             # Filter placeholders start at $3 in the main query; the probe only
             # binds them, so renumber them to $2.. for its own statement.
@@ -645,7 +686,7 @@ async def search(
     if abstain and ABSTAIN_ENABLED:
         _t3 = time.perf_counter()
         abstained, abstain_note = await judge_abstain(
-            app.state.http, q, list(rows[: int(limit)]))
+            app.state.http, q, list(rows[:ABSTAIN_ROWS]))
         _t_abstain = time.perf_counter() - _t3
 
     rank_note = "off"
