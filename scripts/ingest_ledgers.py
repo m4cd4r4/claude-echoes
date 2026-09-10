@@ -4,7 +4,7 @@
 Why this exists
 ---------------
 claude-echoes indexed 108,570 chat messages and none of the three ledgers that
-sit beside them. Measured 2026-08-29: asking "what did we decide about the ERF
+sit beside them. Measured 2026-08-29: asking "what did we decide about the
 hero video" returned the right conversations and missed the logged decision,
 because the logged decision was never in the index.
 

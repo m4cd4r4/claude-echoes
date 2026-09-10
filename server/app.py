@@ -37,7 +37,7 @@ MAX_CONTENT_CHARS = 8000   # nomic context window is 8192 tokens; clip safely
 
 # --- re-ranker -------------------------------------------------------------
 # Retrieval matches on shared vocabulary. When a question and its answer share
-# none, both arms miss: "what did we decide about the ERF hero video" never
+# none, both arms miss: "what did we decide about the hero video" never
 # reaches the message that says "triptych" and "IMG_5506", because the question
 # contains neither word. No amount of lexical relaxation fixes that - the terms
 # are simply absent.

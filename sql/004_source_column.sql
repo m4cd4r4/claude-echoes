@@ -1,7 +1,7 @@
 -- Gap 1: the verbatim chat index was only ONE of four memory layers, and the
 -- other three were never searchable. Measured 2026-08-29: 108,570 chat messages
 -- were indexed while 759 dated ledger entries - the layer that actually records
--- what SUPERSEDED what - were not. A /recall for the ERF hero decision returned
+-- what SUPERSEDED what - were not. A /recall for a hero-image decision returned
 -- the conversation and missed the logged decision, because the logged decision
 -- was not in the index at all.
 --
