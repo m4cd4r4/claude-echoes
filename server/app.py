@@ -60,6 +60,13 @@ RERANK_TIMEOUT = 60
 RECENCY_WEIGHT = float(os.environ.get("ECHOES_RECENCY_WEIGHT", "0.0008"))
 RECENCY_HALFLIFE_DAYS = float(os.environ.get("ECHOES_RECENCY_HALFLIFE_DAYS", "45"))
 
+# Abstention. Needs the same local model as the re-ranker, so it is GPU-gated
+# alongside it and off in the base stack.
+ABSTAIN_ENABLED = os.environ.get("ECHOES_ABSTAIN", "0") not in ("0", "", "false")
+ABSTAIN_ROWS = 5      # how many of the final rows the judge is shown
+ABSTAIN_SNIPPET = 700 # chars each; larger than the re-ranker's, see judge_abstain
+ABSTAIN_TIMEOUT = 45
+
 # --- models ---------------------------------------------------------------
 
 class MessageIn(BaseModel):
@@ -293,6 +300,78 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
     return picked, "ok"
 
 
+async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
+    """Decide whether the corpus actually holds an answer. Returns (abstain, why).
+
+    A SCORE FLOOR CANNOT DO THIS, and the measurement is worth recording because
+    the score floor is the obvious design and it is wrong. Measured 2026-09-10
+    against subjects SQL-verified absent from the index:
+
+      query                                  RRF     cosine   really present?
+      gitleaks sweep                         0.0323  0.7684   yes
+      Squarespace TipTap setContent          0.0170  0.6905   yes
+      Knurl App Store submission             0.0169  0.8485   NO
+      Cloudflare Workers AEO collector       0.0325  0.6770   NO
+
+    Both absent subjects outscore a present one on one metric or the other, and
+    the highest cosine of the whole set belongs to a subject that was never
+    discussed. The reason is that absence here is COMPOSITIONAL: 'Knurl' is a
+    real project and 'App Store' is a real topic, so the query embeds close to
+    genuine material no matter what. No threshold on retrieval score separates
+    'we discussed this' from 'we discussed things near this', because the
+    geometry is the same in both cases.
+
+    So the question has to be asked of a model that can read the passages and
+    judge entailment, not of a number. This is the re-ranker's model, one extra
+    call, on the FINAL rows only.
+
+    Two deliberate choices:
+
+    - the snippet is longer than the re-ranker's 420 chars. Ranking needs only
+      enough to tell rows apart; abstention needs enough to see whether the
+      answer is actually stated, and a truncated passage reads as a non-answer.
+    - it FAILS OPEN. If the model errors or returns anything unparseable, the
+      rows are returned. A false abstention silently hides a corpus that does
+      contain the answer, and the user cannot tell that from a genuine absence -
+      whereas a false answer is at least visible and checkable. The one failure
+      mode this feature must not have is inventing absence.
+    """
+    if not rows:
+        return False, "no rows"
+
+    ctx = "\n\n".join(
+        f"[{i+1}] {r['content'][:ABSTAIN_SNIPPET]}"
+        for i, r in enumerate(rows[:ABSTAIN_ROWS])
+    )
+    prompt = (
+        f"Question: {q}\n\n"
+        f"Passages retrieved from a chat archive:\n{ctx}\n\n"
+        "Is there anything in the passages above a person could use to answer "
+        "the question - even partially, indirectly, or as background?\n\n"
+        "Answer NO only if the passages are about entirely different subjects "
+        "and contain nothing bearing on the question at all. When in doubt, "
+        "answer YES.\n"
+        "Answer with only YES or NO."
+    )
+    try:
+        async with session.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": RERANK_MODEL, "prompt": prompt, "stream": False,
+                  "options": {"temperature": 0, "num_predict": 4}},
+            timeout=aiohttp.ClientTimeout(total=ABSTAIN_TIMEOUT),
+        ) as r:
+            if r.status != 200:
+                return False, f"judge http {r.status}"
+            text = (await r.json()).get("response", "").strip().upper()
+    except Exception as e:
+        return False, f"judge unavailable: {type(e).__name__}"
+
+    if text.startswith("NO"):
+        return True, "judge: no passage answers the question"
+    if text.startswith("YES"):
+        return False, "judge: answered"
+    return False, f"judge unparseable: {text[:12]!r}"
+
 @app.get("/health")
 async def health():
     """Exercise BOTH dependencies. A health check that cannot fail while the
@@ -370,6 +449,7 @@ async def search(
     candidates: int = Query(60, ge=10, le=500),
     drop_self: bool = Query(True),
     recency: bool = Query(True),
+    abstain: bool = Query(True),
 ):
     """Hybrid retrieval: dense vector + lexical BM25-ish, fused with RRF.
 
@@ -551,21 +631,45 @@ async def search(
         _t_sql = time.perf_counter() - _t1
         _t_probe = _t1 - _t0 - _t_embed
 
+    # Abstain BEFORE re-ranking, deliberately. Measured 2026-09-10 on four
+    # subjects SQL-verified absent from the index: judging the RRF order
+    # abstained on 3 of 4, judging the re-ranked order abstained on 1 of 4.
+    #
+    # The two components pull against each other. The re-ranker's entire job is
+    # to lift the most plausible-looking rows to the top, and a plausible-looking
+    # near-miss is exactly what convinces a judge that the subject is present.
+    # Re-ranking first therefore hands the judge the strongest possible case for
+    # answering, on precisely the queries where it should refuse.
+    abstained, abstain_note = False, "off"
+    _t_abstain = 0.0
+    if abstain and ABSTAIN_ENABLED:
+        _t3 = time.perf_counter()
+        abstained, abstain_note = await judge_abstain(
+            app.state.http, q, list(rows[: int(limit)]))
+        _t_abstain = time.perf_counter() - _t3
+
     rank_note = "off"
     _t_rank = 0.0
-    if do_rerank:
-        _t2 = time.perf_counter()
-        rows, rank_note = await rerank(app.state.http, q, list(rows), int(limit))
-        _t_rank = time.perf_counter() - _t2
-    rows = rows[: int(limit)]
+    if abstained:
+        rows = []
+        rank_note = "skipped (abstained)"
+    else:
+        if do_rerank:
+            _t2 = time.perf_counter()
+            rows, rank_note = await rerank(app.state.http, q, list(rows), int(limit))
+            _t_rank = time.perf_counter() - _t2
+        rows = rows[: int(limit)]
 
     return {
         "query": q,
+        "abstained": abstained,
+        "abstain": abstain_note,
         "mode": "hybrid" if hybrid else "vector",
         "lex_query": (params[1] if hybrid else None),
         "rerank": rank_note,
         "timings_ms": {"embed": round(_t_embed*1000), "probe": round(_t_probe*1000),
-                       "sql": round(_t_sql*1000), "rerank": round(_t_rank*1000)},
+                       "sql": round(_t_sql*1000), "rerank": round(_t_rank*1000),
+                       "abstain": round(_t_abstain*1000)},
         "count": len(rows),
         "results": [
             {

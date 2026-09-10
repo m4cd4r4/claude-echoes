@@ -30,6 +30,9 @@ services:
   server:
     environment:
       ECHOES_RERANK: "1"
+      # Abstention uses the same model as the re-ranker, so it is only viable
+      # where the re-ranker is. One extra generation per query.
+      ECHOES_ABSTAIN: "1"
 
   ollama:
     deploy:
