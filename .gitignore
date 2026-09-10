@@ -26,3 +26,7 @@ benchmarks/graded_*
 benchmarks/plan_*.sql
 benchmarks/judge.log
 !benchmarks/eval_pool_SCHEMA.md
+
+# Local abstention cases name real clients - keep them out of the public repo.
+# Commit abstention_hard.example.json instead.
+benchmarks/abstention_hard.json

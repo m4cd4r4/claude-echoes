@@ -1,0 +1,45 @@
+{
+  "_readme": [
+    "COMPOSITIONAL abstention cases: every component is real, only the combination",
+    "never happened. These are the hard kind. The generated set's own abstention",
+    "cases are FOREIGN subjects (a Fastly CDN migration, a Kubernetes rollout) that",
+    "share no vocabulary with the corpus and are easy to refuse - measured",
+    "2026-09-10, the shipped judge catches 3 of 5 of those and 1 of 4 of these.",
+    "",
+    "Safe to commit to a public repo: a question about something that never",
+    "happened contains no archive content by construction. That is why this file",
+    "exists while benchmarks/eval_cases.json stays gitignored.",
+    "",
+    "THEY DECAY ON USE. Asking one of these questions in a live session puts the",
+    "words into the index, and the case stops being a negative. one negative case",
+    "went from 0 hits to 1 within an hour of being used as a test.",
+    "ALWAYS run scripts/verify_abstention_cases.mjs before trusting a score.",
+    "",
+    "terms = ILIKE fragments that must ALL appear in one message for the subject",
+    "to count as present. Keep them broad; a narrow term makes absence trivial",
+    "and the case worthless.",
+    "",
+    "THIS IS THE TEMPLATE. Copy to abstention_hard.json (gitignored) and replace",
+    "the cases with compounds from YOUR OWN corpus - both components real, the",
+    "combination absent. Generic examples cannot work: a subject your archive has",
+    "never heard of is a FOREIGN negative, which is the easy kind this file exists",
+    "to stop measuring."
+  ],
+  "cases": [
+    {
+      "q": "what did we decide about the <CLIENT> loyalty points scheme",
+      "terms": [
+        "loyalty points"
+      ],
+      "why": "a real client, and a plausible feature that was never discussed"
+    },
+    {
+      "q": "how did the <PROJECT> <PLAUSIBLE INTEGRATION> work go",
+      "terms": [
+        "<project keyword>",
+        "<integration keyword>"
+      ],
+      "why": "both components appear in the corpus separately; the pairing does not"
+    }
+  ]
+}

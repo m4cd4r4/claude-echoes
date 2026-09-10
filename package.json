@@ -1,0 +1,13 @@
+{
+  "name": "claude-echoes-scripts",
+  "private": true,
+  "type": "module",
+  "description": "Dev/eval scripts only. The server itself is Python and needs none of this.",
+  "scripts": {
+    "verify:abstention": "node scripts/verify_abstention_cases.mjs --score",
+    "eval:graded": "node scripts/eval_graded.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}
