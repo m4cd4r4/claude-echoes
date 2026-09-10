@@ -22,7 +22,15 @@
 #   docker logs echoes-ollama | grep "inference compute"
 #     library=cpu    -> the override is not applied
 #     library=cuda   -> GPU in use
+# This override is ALSO the supported path for the LLM re-ranker: the base
+# stack ships with ECHOES_RERANK=0 because a 7B judge on CPU is not viable.
+# Pull the judge once after the stack is up:
+#   docker compose exec ollama ollama pull qwen2.5:7b-instruct
 services:
+  server:
+    environment:
+      ECHOES_RERANK: "1"
+
   ollama:
     deploy:
       resources:

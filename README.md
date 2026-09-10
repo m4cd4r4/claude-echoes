@@ -12,7 +12,7 @@ Every prompt, every response, every project — searchable by meaning, across ev
 
 **Benchmarked honestly.** **86.4% on [LongMemEval](https://github.com/xiaowu0162/LongMemEval)** (ICLR 2025) with Sonnet 4.6 - pgvector cosine + BM25 RRF hybrid + temporal re-ranking + LLM re-ranker. **100% on single-session-user retrieval** (70/70). Full per-category breakdown, raw outputs, and reproduction steps in [benchmarks/](benchmarks/). No hardcoded answer patterns. No invented terminology. No cherry-picking.
 
-**What the SERVER runs, as of 2026-08-29.** `/search` runs pgvector cosine and Postgres full-text fused with RRF, then a **local LLM re-ranker** (`qwen2.5:7b-instruct` on ollama - no data leaves the machine). It still has **no temporal re-ranking**, and the 86.4% figure was measured by [benchmarks/run_longmemeval.py](benchmarks/run_longmemeval.py) with a cloud model, so treat it as the ceiling of the approach rather than the score of the service you get from `docker compose up`. The re-ranker needs the GPU override - a 3B judge measured *worse* than no re-ranker at all. What the service does score is in [docs/retrieval-test-2026-08-29.md](docs/retrieval-test-2026-08-29.md): **6/7 at top-5, MRR 0.857** on a graded set of natural-language questions whose answers were confirmed present in the corpus by SQL first, run by [scripts/eval_retrieval.mjs](scripts/eval_retrieval.mjs) against a real 108,570-message archive.
+**What the SERVER runs, as of 2026-08-29.** `/search` runs pgvector cosine and Postgres full-text fused with RRF, then, **optionally, a local LLM re-ranker** (`qwen2.5:7b-instruct` on ollama - no data leaves the machine). The re-ranker is **off by default** and needs the GPU override. It still has **no temporal re-ranking**, and the 86.4% figure was measured by [benchmarks/run_longmemeval.py](benchmarks/run_longmemeval.py) with a cloud model, so treat it as the ceiling of the approach rather than the score of the service you get from `docker compose up`. A 3B judge measured *worse* than no re-ranker at all, so do not swap the model down to fit VRAM. What the service scores is in [docs/graded-eval-2026-08-30.md](docs/graded-eval-2026-08-30.md), measured on a generated 67-case set against a real 108,570-message archive: **single-session Recall@5 0.545 with the re-ranker on, 0.500 without** (re-measured 2026-09-10). Abstention is **0.000** either way - `/search` has no score floor, so a question about a subject absent from the corpus still returns five confident rows. [scripts/eval_retrieval.mjs](scripts/eval_retrieval.mjs) is a 7-case **smoke test**, not a benchmark - it was written by the session that built the retriever, so it selected for what the retriever could already serve, and its 6/7 overstated retrieval by roughly 2x. Do not settle a ranking decision on it.
 
 ---
 
@@ -72,7 +72,7 @@ The installer will:
 2. Pull the `nomic-embed-text` model (~275MB)
 3. Apply the schema migration
 4. Install the Claude Code hook into `~/.claude/hooks/claude-echoes/`
-5. Install the `/recall` skill into `~/.claude/skills/claude-echoes/`
+5. Install the `/recall` skill into `~/.claude/skills/recall/`
 6. Print a test command to verify
 
 Total time: ~10 minutes (most of which is pulling the ollama model).
@@ -185,9 +185,16 @@ If you have older Claude Code session logs in `~/.claude/daily-logs/` or any oth
 
 - Docker + docker-compose
 - Claude Code (any recent version with hook support)
-- ~500MB disk (Postgres + Ollama model + a year of chat history)
-- ~1GB RAM for the stack
-- CPU only — no GPU required. On a modest VPS, embedding takes ~150ms per message.
+- ~1GB disk for the base stack (Postgres + nomic-embed-text + a year of chat
+  history), plus 4.7GB if you enable the LLM re-ranker
+- ~2GB RAM for the base stack
+- **Base stack is CPU-only** — no GPU required for logging and search. On a
+  modest VPS, embedding takes ~150ms per message.
+- **The LLM re-ranker needs a GPU.** It is `qwen2.5:7b-instruct`, and a 7B judge
+  on CPU is not viable; the 3B that would be measured *worse* than no re-ranker.
+  It ships OFF (`ECHOES_RERANK=0`) and is enabled by the GPU override — see
+  [docker-compose.gpu.yml](docker-compose.gpu.yml). A backfill of a large archive
+  also wants the GPU: CPU embedding puts 108k messages at about 99 hours.
 
 ---
 

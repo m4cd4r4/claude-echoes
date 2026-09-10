@@ -22,6 +22,7 @@ Queries the local `claude-echoes` server for past Claude Code messages matching 
 | `/recall <query> --role user` | Only user prompts |
 | `/recall <query> --role assistant` | Only assistant responses |
 | `/recall <query> --limit <N>` | Change result count (default 10) |
+| `/recall <query> --vector-only` | Dense-vector search only, skipping the lexical arm |
 
 ---
 
@@ -40,11 +41,27 @@ curl -sG "${ECHOES_URL:-http://localhost:8088}/search" \
   [--data-urlencode "days=<days>"]
 ```
 
+Pass `hybrid=false` only for `--vector-only`.
+
+Search is hybrid by default: dense vector and Postgres full-text, fused with
+Reciprocal Rank Fusion. The lexical arm is what catches exact tokens an
+embedding blurs - an error string, a flag, a commit sha, a port number - so
+prefer the default. `--vector-only` exists to compare the two on the same data,
+which is the only honest way to tell whether a disappointing result is the
+retrieval or the corpus.
+
 If the server is unreachable, say so plainly. Do not fall back to guessing or summarising from your own context.
+
+**A miss is a real answer.** An empty result means the conversation is not in the
+index, and the index starts at 2026-01-02. Say that, rather than reaching into
+your own context and presenting a recollection as a search result - the whole
+value of this tool is that its answers are verbatim records.
 
 **Step 3 — Present results.** For each hit, show:
 
-- Similarity score (3 decimals)
+- Rank, as `1.` `2.` `3.` - NOT the `similarity` field. Under Reciprocal Rank
+  Fusion that number is ~0.016-0.033 on every hit; it orders results and means
+  nothing on its own, so showing it invites the user to read a 0.03 as a bad match
 - Project name + role + date (convert UTC to user's local timezone)
 - First 200 chars of content as a snippet, with ellipsis if truncated
 - Session ID in `[abbreviated]` form (first 8 chars) so the user can ask for full context
@@ -52,11 +69,11 @@ If the server is unreachable, say so plainly. Do not fall back to guessing or su
 Format example:
 
 ```
-0.731  azureprep    user       2026-04-08 15:09   [ada9a195]
-       "I would like semantic search across verbatim chat history..."
+1.  azureprep    user       2026-04-08 15:09   [ada9a195]
+    "I would like semantic search across verbatim chat history..."
 
-0.684  cosmos-collective  assistant  2026-04-05 22:14   [b831cc02]
-       "The partition key for the users container must be /email..."
+2.  cosmos-collective  assistant  2026-04-05 22:14   [b831cc02]
+    "The partition key for the users container must be /email..."
 ```
 
 **Step 4 — Offer follow-up.** After showing results, ask if the user wants the full surrounding conversation for any hit. If yes, call:

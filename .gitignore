@@ -13,4 +13,16 @@ data/
 .idea/
 dist/
 build/
-hn-launch-post.mdcache/
+cache/
+
+# Generated eval material: verbatim questions and answer snippets from the
+# private archive. The scripts regenerate it locally from whatever corpus you
+# have - the DATA must never land in this public repo.
+# Deliberately a WILDCARD, not a list of filenames. A named list only covers
+# the variants that existed when it was written, and one stray variant
+# (eval_cases_notemporal.json) was already sitting untracked and unignored.
+benchmarks/eval_*
+benchmarks/graded_*
+benchmarks/plan_*.sql
+benchmarks/judge.log
+!benchmarks/eval_pool_SCHEMA.md

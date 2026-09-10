@@ -15,6 +15,7 @@
 const http  = require('http');
 const https = require('https');
 const path  = require('path');
+const fs    = require('fs');
 
 const ECHOES_URL  = process.env.ECHOES_URL  || 'http://localhost:8088';
 const ECHOES_TOKEN = process.env.ECHOES_TOKEN || '';
@@ -42,6 +43,37 @@ function detectProject(hookInput) {
   return path.basename(process.cwd());
 }
 
+// The Stop hook does NOT carry the assistant's reply in its payload - it carries
+// `transcript_path`, the session's JSONL. Read the last assistant entry out of
+// it. An earlier version read `hookInput.response.blocks`, a field that does not
+// exist, so no install ever stored a single assistant message.
+function getLastAssistantMessage(transcriptPath) {
+  try {
+    if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
+    const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i]) continue;
+      let entry;
+      try { entry = JSON.parse(lines[i]); } catch { continue; }
+      if (entry.type !== 'assistant' || !entry.message) continue;
+
+      const content = entry.message.content;
+      let text = '';
+      if (typeof content === 'string') {
+        text = content;
+      } else if (Array.isArray(content)) {
+        text = content.filter(c => c && c.type === 'text').map(c => c.text || '').join('\n');
+      }
+      text = text.trim();
+      // Tool-only turns carry no text. Keep walking back rather than storing an
+      // empty row for every tool call.
+      if (!text) continue;
+      return { text: text.slice(0, 10000), model: entry.message.model || null };
+    }
+  } catch (e) { log('transcript read failed:', e.message); }
+  return null;
+}
+
 function extractEntry(hookInput) {
   const event = hookInput.hook_event_name || '';
 
@@ -50,15 +82,9 @@ function extractEntry(hookInput) {
   }
 
   if (event === 'Stop') {
-    const blocks = (hookInput.response && hookInput.response.blocks) || [];
-    const text = blocks
-      .filter(b => b && b.type === 'text')
-      .map(b => b.text || '')
-      .join('\n')
-      .trim();
-    if (!text) return null;
-    const model = (hookInput.response && hookInput.response.model) || null;
-    return { role: 'assistant', content: text, model };
+    const last = getLastAssistantMessage(hookInput.transcript_path);
+    if (!last) return null;
+    return { role: 'assistant', content: last.text, model: last.model };
   }
 
   return null;

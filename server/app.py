@@ -49,7 +49,7 @@ MAX_CONTENT_CHARS = 8000   # nomic context window is 8192 tokens; clip safely
 # It runs locally on ollama, so the "no conversation data leaves the machine"
 # property survives. One BATCHED call scores every candidate at once - scoring
 # them individually would be N generations per query and is not worth it.
-RERANK_MODEL   = os.environ.get("ECHOES_RERANK_MODEL", "qwen2.5:3b-instruct")
+RERANK_MODEL   = os.environ.get("ECHOES_RERANK_MODEL", "qwen2.5:7b-instruct")
 RERANK_ENABLED = os.environ.get("ECHOES_RERANK", "1") not in ("0", "false", "False")
 RERANK_POOL    = 24    # candidates handed to the model
 RERANK_SNIPPET = 420   # chars of each candidate the model sees
@@ -151,9 +151,9 @@ async def embed_text(http: aiohttp.ClientSession, text: str) -> Optional[str]:
 # silently degraded to vector-only, which is weakest on exactly the "which
 # number was it" lookups this tool exists for.
 #
-# So we keep AND first (it is precise when it fires) and fall back to OR when it
-# returns almost nothing. ts_rank still rewards documents carrying MORE of the
-# terms, so the OR arm degrades gracefully rather than flooding.
+# The fix is NOT a pure OR fallback - that was measured at 29-46s a query,
+# because ts_rank has no IDF term and a wide OR buries the rare word. Instead
+# the AND is relaxed one term at a time, longest first, in a single statement.
 _STOP = {
     "a","an","and","are","as","at","be","but","by","did","do","does","for","from",
     "get","give","had","has","have","how","i","if","in","into","is","it","its","many",
@@ -161,8 +161,6 @@ _STOP = {
     "them","then","there","these","this","to","was","we","were","what","when","where",
     "which","who","why","will","with","would","you","your","actually","really","just",
 }
-DF_CAP = 2000  # capped document frequency: only the ordering matters  # below this many AND hits, retry the lexical arm with OR
-
 
 def content_words(q: str) -> list:
     """Query words with stopwords and question words dropped, deduped, and
@@ -277,7 +275,7 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
     if not picked:
         # The model judged nothing relevant. That is a real answer for a
         # question the archive cannot serve, but it is indistinguishable from a
-        # sulking 3B model, so keep RRF order and say so.
+        # judge that simply declined to answer, so keep RRF order and say so.
         return rows, "model returned empty"
     # Anything it did not name keeps its RRF order behind what it did.
     picked += [r for i, r in enumerate(rows) if i not in seen]

@@ -42,6 +42,11 @@ services:
       ECHOES_OLLAMA_URL: http://ollama:11434
       ECHOES_OLLAMA_MODEL: nomic-embed-text
       ECHOES_RERANK_MODEL: qwen2.5:7b-instruct
+      # OFF in the base stack. The re-ranker is a 7B judge (4.7 GB) and a 7B
+      # judge on CPU is not viable - and qwen2.5:3b-instruct, the size that
+      # would be, measured WORSE than no re-ranker at all. Turn it on with the
+      # GPU override (docker-compose.gpu.yml), which also pulls the model.
+      ECHOES_RERANK: "0"
     depends_on:
       postgres:
         condition: service_healthy

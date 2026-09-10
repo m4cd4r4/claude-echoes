@@ -37,10 +37,23 @@ for i in {1..30}; do
 done
 
 echo "==> applying schema..."
-docker exec -i echoes-postgres psql -U echoes -d echoes < "$REPO_DIR/sql/001_init.sql"
+# Every migration, in order. 001 alone leaves the table without the columns
+# app.py SELECTs (source arrives in 004), so a fresh install 500s on /search.
+for f in "$REPO_DIR"/sql/0*.sql; do
+  echo "    $(basename "$f")"
+  docker exec -i echoes-postgres psql -U echoes -d echoes -v ON_ERROR_STOP=1 < "$f"
+done
 
 echo "==> pulling nomic-embed-text model (~275MB)..."
 docker exec echoes-ollama ollama pull nomic-embed-text
+
+# The LLM re-ranker is OFF in the base stack. It is qwen2.5:7b-instruct (4.7 GB)
+# and a 7B judge on CPU is not viable; the 3B that would be measured WORSE than
+# no re-ranker. Enabling it is the GPU path, not a checkbox.
+echo "==> re-ranker: OFF (base stack is CPU-only)"
+echo "    To enable it on an NVIDIA box:"
+echo "      docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d"
+echo "      docker compose exec ollama ollama pull qwen2.5:7b-instruct"
 
 echo "==> waiting for server..."
 for i in {1..30}; do
