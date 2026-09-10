@@ -346,9 +346,11 @@ async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
     prompt = (
         f"Question: {q}\n\n"
         f"Passages retrieved from a chat archive:\n{ctx}\n\n"
-        "Does any passage above actually record a discussion, decision or answer "
-        "about the SPECIFIC subject of the question? Being about a related or "
-        "adjacent topic is NOT enough - the specific subject must be present.\n"
+        "Is there anything in the passages above a person could use to answer "
+        "the question - even partially, indirectly, or as background?\n\n"
+        "Answer NO only if the passages are about entirely different subjects "
+        "and contain nothing bearing on the question at all. When in doubt, "
+        "answer YES.\n"
         "Answer with only YES or NO."
     )
     try:
