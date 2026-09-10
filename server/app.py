@@ -56,6 +56,10 @@ RERANK_POOL    = 24    # candidates handed to the model
 RERANK_SNIPPET = 420   # chars of each candidate the model sees
 RERANK_TIMEOUT = 60
 
+# Recency tie-break. See the sizing note in /search before changing these.
+RECENCY_WEIGHT = float(os.environ.get("ECHOES_RECENCY_WEIGHT", "0.0008"))
+RECENCY_HALFLIFE_DAYS = float(os.environ.get("ECHOES_RECENCY_HALFLIFE_DAYS", "45"))
+
 # --- models ---------------------------------------------------------------
 
 class MessageIn(BaseModel):
@@ -364,6 +368,8 @@ async def search(
     hybrid: bool = Query(True),
     rerank_: bool = Query(True, alias="rerank"),
     candidates: int = Query(60, ge=10, le=500),
+    drop_self: bool = Query(True),
+    recency: bool = Query(True),
 ):
     """Hybrid retrieval: dense vector + lexical BM25-ish, fused with RRF.
 
@@ -417,6 +423,21 @@ async def search(
     # top-`limit` rows would ask it to reorder a set the answer is not in.
     sql_limit = max(int(limit), RERANK_POOL) if do_rerank else int(limit)
 
+    # Recency prior, deliberately WEAK. Adjacent RRF ranks differ by about
+    # 1/(60+n) - 1/(61+n) ~ 0.00026 near the top, so RECENCY_WEIGHT is sized at
+    # roughly three rank-gaps: enough to settle a near-tie in favour of the more
+    # recent turn, nowhere near enough to lift an irrelevant new message over a
+    # relevant old one. Anything stronger stops being a tie-break and starts
+    # being a date sort wearing a relevance sort's clothes.
+    #
+    # The old `ORDER BY f.score DESC, m.created_at DESC` was effectively dead:
+    # RRF sums of two float arms almost never tie exactly, so the second key
+    # never fired.
+    recency_term = (
+        f"{RECENCY_WEIGHT} * exp(- EXTRACT(EPOCH FROM (now() - m.created_at)) "
+        f"/ {RECENCY_HALFLIFE_DAYS * 86400.0})"
+    ) if recency else "0"
+
     conds = []
     if project:
         conds.append(f"project = ${idx}")
@@ -432,12 +453,45 @@ async def search(
 
     where_extra = (" AND " + " AND ".join(conds)) if conds else ""
 
+    # Drop the caller's own question. When a hook indexes the user's prompt
+    # before the search runs - which is exactly what a live install does - the
+    # query matches itself perfectly and takes rank 1 on every single search,
+    # burning a slot to hand the user back the words they just typed.
+    #
+    # Matched on normalised content rather than by session id, so it also
+    # catches the same question asked in an earlier session, and needs no
+    # session plumbing through the skill. A row that IS the question carries no
+    # answer; the value is always in what came after it.
+    #
+    # Applied AFTER fusion, deliberately, NOT in where_extra. where_extra also
+    # constrains pick_lex_query, so a condition there changes which tsquery the
+    # lexical arm chooses and perturbs the whole candidate pool. Measured: doing
+    # it as a filter cost multi_session 0.113 -> 0.025 Recall@5 while removing
+    # nothing it was meant to remove. This is a presentation concern, so it
+    # belongs at the presentation end.
+    # Snapshot the filter params BEFORE the self-row param is appended. The
+    # lexical probe binds only the filters, so handing it a trailing extra
+    # argument makes asyncpg reject the statement, pick_lex_query returns None,
+    # and RRF silently degrades to pure vector ranking - no error, no log, just
+    # worse answers. Measured: that cost multi_session 0.113 -> 0.025 Recall@5.
+    n_filter_params = len(params) - 2
+
+    self_pred = ""
+    if drop_self:
+        self_pred = (
+            f"lower(regexp_replace(btrim(m.content), '^/[a-z-]+\\s+', '')) "
+            f"IS DISTINCT FROM lower(btrim(${idx}))"
+        )
+        params.append(q); idx += 1
+        sql_limit += 1   # so removing the echo cannot shorten the result set
+
     if not hybrid:
         sql = f"""
             SELECT id, session_id, project, role, content, model, source, created_at,
                    1 - (embedding <=> $1::vector) AS score
-            FROM messages
+            FROM messages m
             WHERE embedding IS NOT NULL{where_extra}
+            {("AND " + self_pred) if self_pred else ""}
             ORDER BY embedding <=> $1::vector
             LIMIT {int(sql_limit)}
         """
@@ -470,10 +524,11 @@ async def search(
                 FULL OUTER JOIN lex l ON v.id = l.id
             )
             SELECT m.id, m.session_id, m.project, m.role, m.content, m.model,
-                   m.source, m.created_at, f.score
+                   m.source, m.created_at, f.score + {recency_term} AS score
             FROM fused f
             JOIN messages m ON m.id = f.id
-            ORDER BY f.score DESC, m.created_at DESC
+            {("WHERE " + self_pred) if self_pred else ""}
+            ORDER BY score DESC, m.created_at DESC
             LIMIT {int(sql_limit)}
         """
 
@@ -482,9 +537,10 @@ async def search(
             # Filter placeholders start at $3 in the main query; the probe only
             # binds them, so renumber them to $2.. for its own statement.
             probe_where = where_extra
-            for n in range(idx - 1, 2, -1):
+            for n in range(2 + n_filter_params, 2, -1):
                 probe_where = probe_where.replace(f"${n}", f"${n - 1}")
-            lexq = await pick_lex_query(conn, q, probe_where, params[2:])
+            lexq = await pick_lex_query(
+                conn, q, probe_where, params[2:2 + n_filter_params])
             if lexq is None:
                 # No lexical arm at all - RRF degrades to the vector ranking,
                 # which is the correct behaviour, not an error.

@@ -19,6 +19,10 @@ const arg = (k, d) => (process.argv.find(a => a.startsWith(`--${k}=`)) || '').sp
 const BASE   = process.argv[2]?.startsWith('http') ? process.argv[2] : 'http://127.0.0.1:8088';
 const K      = Number(arg('k', 5));
 const RERANK = arg('rerank', '1') !== '0';
+// A/B switches for the two ranking priors, so a regression can be attributed to
+// one of them rather than to 'the last deploy'. Default matches server default.
+const RECENCY   = arg('recency', '1') !== '0';
+const DROP_SELF = arg('drop-self', '1') !== '0';
 const OUT    = arg('out', '');
 const CASES  = JSON.parse(readFileSync(arg('cases', 'benchmarks/eval_cases.json'), 'utf8'));
 
@@ -48,6 +52,8 @@ for (const c of CASES) {
   const s = bump(c.category);
   const params = new URLSearchParams({ q: c.q, limit: String(K) });
   if (!RERANK) params.set('rerank', 'false');
+  if (!RECENCY) params.set('recency', 'false');
+  if (!DROP_SELF) params.set('drop_self', 'false');
   if (c.days) params.set('days', String(c.days));
   // The query text for a gold-bearing case IS the user's own turn, and that row
   // is in the index: it embeds at cosine 1.0 and carries every lexical term, so
