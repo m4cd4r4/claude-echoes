@@ -138,6 +138,17 @@ if (arg('only', '') === 'multi_session') {
   console.error(`rewrote multi_session only: ${next.filter(c => c.category === 'multi_session').length} cases`);
   process.exit(0);
 }
+// --only=single_session grows (or shrinks) that category to --n. The pool order
+// is fixed, so the first cases stay identical and the old run remains comparable
+// on them; every other category is left exactly as it was.
+if (arg('only', '') === 'single_session') {
+  const prev = JSON.parse(readFileSync('benchmarks/eval_cases.json', 'utf8'));
+  const single = cases.filter(c => c.category === 'single_session');
+  const next = [...single, ...prev.filter(c => c.category !== 'single_session')];
+  writeFileSync('benchmarks/eval_cases.json', JSON.stringify(next, null, 2) + '\n');
+  console.error(`rewrote single_session only: ${single.length} cases`);
+  process.exit(0);
+}
 cases.push(...buildMultiSession());
 
 // --- Category 5: abstention ------------------------------------------------
