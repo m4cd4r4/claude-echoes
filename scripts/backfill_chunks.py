@@ -2,7 +2,7 @@
 """
 Chunk and embed every long message that has no chunks yet (sql/005_chunks.sql).
 
-Resumable: a message is chunked in one transaction, and messages that already
+Resumable: each batch is written in one transaction, and messages that already
 have chunk rows are skipped, so a killed run picks up where it stopped.
 Live writes chunk themselves once the table exists; this covers the history.
 
@@ -53,22 +53,28 @@ async def embed(http, sem, text: str):
         return None
 
 
-async def do_message(pool, http, sem, mid: int, content: str, stats: dict):
+async def chunk_message(http, sem, mid: int, content: str):
     chunks = split_chunks(content)
     embs = await asyncio.gather(*(embed(http, sem, c) for _, c in chunks))
+    return [(mid, i, s, c, e) for i, ((s, c), e) in enumerate(zip(chunks, embs))]
+
+
+async def write_batch(pool, rows: list, stats: dict):
+    """One transaction per BATCH, not per message. Measured 2026-09-19: a commit
+    per message (~26/s) made Postgres PANIC on a WAL write ("Interrupted system
+    call") through the Windows bind mount of ./data/postgres."""
+    mids = sorted({r[0] for r in rows})
     async with pool.acquire() as conn, conn.transaction():
-        # A live write may have chunked it since the batch was read.
-        if await conn.fetchval(
-                "SELECT 1 FROM message_chunks WHERE message_id = $1 LIMIT 1", mid):
-            return
+        # A live write may have chunked some of these since the batch was read.
+        done = {r["message_id"] for r in await conn.fetch(
+            "SELECT DISTINCT message_id FROM message_chunks WHERE message_id = ANY($1)", mids)}
+        rows = [r for r in rows if r[0] not in done]
         await conn.executemany(
             "INSERT INTO message_chunks (message_id, ord, start_char, content, embedding) "
-            "VALUES ($1, $2, $3, $4, $5::vector)",
-            [(mid, i, s, c, e) for i, ((s, c), e) in enumerate(zip(chunks, embs))],
-        )
-    stats["messages"] += 1
-    stats["chunks"] += len(chunks)
-    stats["null_embeddings"] += sum(e is None for e in embs)
+            "VALUES ($1, $2, $3, $4, $5::vector)", rows)
+    stats["messages"] += len(mids)
+    stats["chunks"] += len(rows)
+    stats["null_embeddings"] += sum(r[4] is None for r in rows)
 
 
 async def main():
@@ -101,8 +107,9 @@ async def main():
                 break
             last_id = rows[-1]["id"]
             # Messages run concurrently too; the semaphore caps embeds, not messages.
-            await asyncio.gather(*(do_message(pool, http, sem, r["id"], r["content"], stats)
-                                   for r in rows))
+            per_msg = await asyncio.gather(*(chunk_message(http, sem, r["id"], r["content"])
+                                             for r in rows))
+            await write_batch(pool, [x for m in per_msg for x in m], stats)
             el = time.perf_counter() - t0
             rate = stats["messages"] / el
             eta = (remaining - stats["messages"]) / rate if rate else 0
