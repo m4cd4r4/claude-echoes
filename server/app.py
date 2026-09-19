@@ -90,6 +90,9 @@ JUDGE_CHUNK  = os.environ.get("ECHOES_JUDGE_CHUNK", "0") not in ("0", "", "false
 # RERANK_CHUNK: the re-ranker reads the matched chunk's best window instead of
 # the row's head. Only changes anything alongside CHUNK_SEARCH.
 RERANK_CHUNK = os.environ.get("ECHOES_RERANK_CHUNK", "0") not in ("0", "", "false")
+# CHUNK_CAP: max parents per arm that may enter the pool through a chunk.
+# 0 = no cap. Measured 2026-09-19 because chunk rows crowded out whole hits.
+CHUNK_CAP    = int(os.environ.get("ECHOES_CHUNK_CAP", "0") or 0)
 
 # --- models ---------------------------------------------------------------
 
@@ -703,6 +706,31 @@ async def search(
         whole = (f"(length(content) <= {CHUNK_MIN_CHARS} OR NOT EXISTS "
                  f"(SELECT 1 FROM message_chunks c WHERE c.message_id = messages.id))")
         cand, cand_c = int(candidates), int(candidates) * 3
+
+        def collapse(raw: str, key: str, best: str) -> str:
+            # Parent rows of one arm: best entry per parent, ranked by `best`.
+            # With CHUNK_CAP > 0, at most CHUNK_CAP parents may come from a
+            # chunk, so short/whole messages keep the rest of the pool.
+            if CHUNK_CAP <= 0:
+                return f"""
+                SELECT mid AS id, (array_agg(sc ORDER BY {key}))[1] AS sc,
+                       ROW_NUMBER() OVER (ORDER BY {best}) AS rnk
+                FROM {raw} GROUP BY mid
+                ORDER BY {best} LIMIT {cand}"""
+            return f"""
+                SELECT id, sc, ROW_NUMBER() OVER (ORDER BY b) AS rnk
+                FROM (
+                    SELECT id, sc, b, ROW_NUMBER() OVER (
+                               PARTITION BY sc IS NULL ORDER BY b) AS src_rn
+                    FROM (
+                        SELECT mid AS id, (array_agg(sc ORDER BY {key}))[1] AS sc,
+                               {best} AS b
+                        FROM {raw} GROUP BY mid
+                    ) g
+                ) h
+                WHERE sc IS NULL OR src_rn <= {CHUNK_CAP}
+                ORDER BY b LIMIT {cand}"""
+
         sql = f"""
             WITH vec_raw AS (
                 (SELECT id AS mid, embedding <=> $1::vector AS d, NULL::int AS sc
@@ -717,11 +745,7 @@ async def search(
                  ORDER BY c.embedding <=> $1::vector
                  LIMIT {cand_c})
             ),
-            vec AS (
-                SELECT mid AS id, (array_agg(sc ORDER BY d))[1] AS sc,
-                       ROW_NUMBER() OVER (ORDER BY min(d)) AS rnk
-                FROM vec_raw GROUP BY mid
-                ORDER BY min(d) LIMIT {cand}
+            vec AS ({collapse('vec_raw', 'd', 'min(d)')}
             ),
             lex_raw AS (
                 (SELECT id AS mid, NULL::int AS sc,
@@ -742,11 +766,7 @@ async def search(
                  ORDER BY r DESC
                  LIMIT {cand_c})
             ),
-            lex AS (
-                SELECT mid AS id, (array_agg(sc ORDER BY r DESC))[1] AS sc,
-                       ROW_NUMBER() OVER (ORDER BY max(r) DESC) AS rnk
-                FROM lex_raw GROUP BY mid
-                ORDER BY max(r) DESC LIMIT {cand}
+            lex AS ({collapse('lex_raw', 'r DESC', '-max(r)')}
             ),
             fused AS (
                 SELECT COALESCE(v.id, l.id) AS id,
