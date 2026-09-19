@@ -81,32 +81,64 @@ for (const c of picked.slice(0, 10)) {
 // --- Category 2: multi-session aggregation --------------------------------
 // A subject is a genuine aggregation case only if the archive discusses it in
 // several DIFFERENT sessions. That is a property of the corpus, decided by SQL.
-const subjects = [...new Set(judged.map(c => (c.subject || '').trim().toLowerCase())
-  .filter(s => s.split(/\s+/).length >= 2 && s.length >= 8 && /^[a-z0-9 .-]+$/.test(s)))];
-
-for (const subj of subjects) {
-  if (cases.filter(c => c.category === 'multi_session').length >= 8) break;
-  const words = subj.split(/\s+/).filter(w => w.length >= 4).slice(0, 3);
-  if (words.length < 2) continue;
-  const conds = words.map(w => `content ILIKE ${sqlLit('%' + w + '%')}`).join(' AND ');
-  let out;
-  try {
-    out = psql(`
-      SELECT DISTINCT ON (session_id) id, session_id FROM messages
-      WHERE role='assistant' AND source='chat' AND ${conds}
-        AND length(content) >= 200
-      ORDER BY session_id, length(content) DESC LIMIT 6;`).trim();
-  } catch { continue; }
-  const parsed = out ? out.split('\n').filter(Boolean).map(l => l.split('|')) : [];
-  if (parsed.length < 3) continue;
-  cases.push({
-    category: 'multi_session', q: `what do we know about ${subj}`,
-    gold_ids: parsed.map(p => Number(p[0])),
-    gold_sessions: parsed.map(p => p[1]),
-    window_ids: parsed.map(p => Number(p[0])),
-    note: `${parsed.length} distinct sessions discuss this`,
-  });
+//
+// Rebuilt 2026-09-19. The first version matched subject words as SUBSTRINGS
+// (ILIKE, so 'test' hit 'latest'), then took the first 6 qualifying sessions in
+// session_id order - a UUID sort, i.e. an arbitrary pick. Measured: subjects had
+// up to 251 qualifying sessions, so a retriever returning any of the other 245
+// scored zero, and multi_session read 0.056 while the returned rows were on topic.
+//
+// Now: whole-word match through the same english tsvector the lexical arm uses,
+// only subjects discussed in 3..MS_MAX_SESSIONS sessions (above that the subject
+// is too generic for "what do we know" to have a checkable answer), and gold is
+// EVERY qualifying row. Scoring counts distinct gold sessions, not rows - see
+// eval_graded.mjs.
+const MS_MAX_SESSIONS = 12;
+function buildMultiSession() {
+  const out = [];
+  const subjects = [...new Set(judged.map(c => (c.subject || '').trim().toLowerCase())
+    .filter(s => s.split(/\s+/).length >= 2 && s.length >= 8 && /^[a-z0-9 .-]+$/.test(s)))];
+  for (const subj of subjects) {
+    if (out.length >= 8) break;
+    const words = subj.split(/\s+/).filter(w => w.length >= 4).slice(0, 3);
+    if (words.length < 2) continue;
+    const tsq = `plainto_tsquery('english', ${sqlLit(words.join(' '))})`;
+    let rows;
+    try {
+      rows = psql(`
+        SELECT id, session_id FROM messages
+        WHERE role='assistant' AND source='chat' AND length(content) >= 200
+          AND to_tsvector('english', content) @@ ${tsq}
+        ORDER BY session_id, id;`).trim();
+    } catch { continue; }
+    const parsed = rows ? rows.split('\n').filter(Boolean).map(l => l.split('|')) : [];
+    const sessions = new Set(parsed.map(p => p[1]));
+    if (sessions.size < 3 || sessions.size > MS_MAX_SESSIONS) {
+      console.error(`  multi_session rejected (${sessions.size} sessions): ${subj}`);
+      continue;
+    }
+    out.push({
+      category: 'multi_session', q: `what do we know about ${subj}`,
+      gold_ids: parsed.map(p => Number(p[0])),
+      gold_session_of: Object.fromEntries(parsed.map(p => [p[0], p[1]])),
+      gold_sessions: [...sessions],
+      window_ids: parsed.map(p => Number(p[0])),
+      note: `${sessions.size} distinct sessions discuss this; any of their matching rows counts`,
+    });
+  }
+  return out;
 }
+
+// --only=multi_session rewrites just that category in the existing set, so the
+// other categories (and every result measured against them) stay comparable.
+if (arg('only', '') === 'multi_session') {
+  const prev = JSON.parse(readFileSync('benchmarks/eval_cases.json', 'utf8'));
+  const next = [...prev.filter(c => c.category !== 'multi_session'), ...buildMultiSession()];
+  writeFileSync('benchmarks/eval_cases.json', JSON.stringify(next, null, 2) + '\n');
+  console.error(`rewrote multi_session only: ${next.filter(c => c.category === 'multi_session').length} cases`);
+  process.exit(0);
+}
+cases.push(...buildMultiSession());
 
 // --- Category 5: abstention ------------------------------------------------
 // Well-formed questions about subjects the archive has never mentioned. The

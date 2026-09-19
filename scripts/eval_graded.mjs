@@ -121,15 +121,26 @@ for (const c of CASES) {
     continue;
   }
 
-  const hitRanks = ids.map((id, i) => (gold.has(id) ? i + 1 : 0)).filter(Boolean);
-  const recall = gold.size ? hitRanks.length / Math.min(gold.size, K) : 0;
+  // A multi_session case with gold_session_of counts distinct SESSIONS: its gold
+  // is every matching row of every qualifying session, so two rows from one
+  // session are one hit, and the ceiling is the session count, not the row count.
+  const sessOf = c.gold_session_of || null;
+  const seen = new Set();
+  const hitRanks = ids.map((id, i) => {
+    if (!gold.has(id)) return 0;
+    if (sessOf) { const sid = sessOf[id]; if (seen.has(sid)) return 0; seen.add(sid); }
+    return i + 1;
+  }).filter(Boolean);
+  const goldUnits = sessOf ? new Set(Object.values(sessOf)).size : gold.size;
+  const recall = goldUnits ? hitRanks.length / Math.min(goldUnits, K) : 0;
   const firstRank = hitRanks[0] || 0;
 
   if (hitRanks.length) { s.hit += recall; s.rr += 1 / firstRank; }
   const inWindow = ids.some(i => win.has(i));
   if (inWindow) s.win++;
-  const ideal = dcg(Array(Math.min(gold.size, K)).fill(1));
-  s.ndcg += ideal ? dcg(ids.map(id => (gold.has(id) ? 1 : 0))) / ideal : 0;
+  const ideal = dcg(Array(Math.min(goldUnits, K)).fill(1));
+  const hitSet = new Set(hitRanks);
+  s.ndcg += ideal ? dcg(ids.map((_, i) => (hitSet.has(i + 1) ? 1 : 0))) / ideal : 0;
 
   const mark = firstRank ? `PASS @${firstRank}` : (inWindow ? 'WIN  ~ ' : 'FAIL   ');
   console.log(`${mark} ${c.category.padEnd(17)} ${String(rows.length).padStart(2)} rows  ${c.q.slice(0, 62)}`);
