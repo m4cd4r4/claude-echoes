@@ -197,22 +197,23 @@ _STOP = {
 
 
 def lex_term(w: str) -> str:
-    """One content word as a PREFIX-matched tsquery term.
+    """One content word as a tsquery term, covering the english stemmer's
+    y->i split.
 
-    The english stemmer splits inflections: "certified" -> certifi but
-    "certification" -> certif, so an exact-stem AND dropped the only row that
-    held the answer. Prefix matching covers a query stem shorter than the
-    document's; stripping the y->i ending covers the reverse case, where the
-    query stem is the longer one. Words under 4 characters stay exact: "ui:*"
-    or "api:*" would match far more than the word.
+    "certified" stems to certifi but "certification" to certif, so an exact
+    AND on the question's stem dropped the only row that held the answer. A
+    word with a y->i ending (-ied, -ies, -y) matches either stem.
+
+    General prefix matching (every term as "word:*") was measured and rejected
+    2026-09-19: it gained one single_session case but pushed multi_session
+    gold down and lowered temporal MRR - broad prefixes are lexical noise.
     """
-    if len(w) < 4:
-        return w
+    base = None
     if len(w) > 5 and (w.endswith("ied") or w.endswith("ies")):
-        w = w[:-3]
+        base = w[:-3]
     elif len(w) > 5 and w.endswith("y"):
-        w = w[:-1]
-    return f"{w}:*"
+        base = w[:-1]
+    return f"({base} | {w})" if base else w
 
 def content_words(q: str) -> list:
     """Query words with stopwords and question words dropped, deduped, and
