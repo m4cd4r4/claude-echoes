@@ -189,7 +189,30 @@ _STOP = {
     "me","much","my","of","on","or","our","should","so","tell","that","the","their",
     "them","then","there","these","this","to","was","we","were","what","when","where",
     "which","who","why","will","with","would","you","your","actually","really","just",
+    # Question-template verbs. Left in, they become REQUIRED terms in the AND:
+    # "tailwind & config & server" matched 20 rows, "+ learn" matched 1.
+    "know","knew","learn","learned","learnt","find","decide","decided",
+    "happen","happened","about","go","went","can","could","may","might","must",
 }
+
+
+def lex_term(w: str) -> str:
+    """One content word as a PREFIX-matched tsquery term.
+
+    The english stemmer splits inflections: "certified" -> certifi but
+    "certification" -> certif, so an exact-stem AND dropped the only row that
+    held the answer. Prefix matching covers a query stem shorter than the
+    document's; stripping the y->i ending covers the reverse case, where the
+    query stem is the longer one. Words under 4 characters stay exact: "ui:*"
+    or "api:*" would match far more than the word.
+    """
+    if len(w) < 4:
+        return w
+    if len(w) > 5 and (w.endswith("ied") or w.endswith("ies")):
+        w = w[:-3]
+    elif len(w) > 5 and w.endswith("y"):
+        w = w[:-1]
+    return f"{w}:*"
 
 def content_words(q: str) -> list:
     """Query words with stopwords and question words dropped, deduped, and
@@ -234,7 +257,8 @@ async def pick_lex_query(conn, q: str, where_sql: str, where_args: list) -> Opti
     if not words:
         return None
     ranked = sorted(words, key=len, reverse=True)
-    tiers = [" & ".join(ranked[:k]) for k in range(len(ranked), 1, -1)]
+    tiers = [" & ".join(lex_term(w) for w in ranked[:k])
+             for k in range(len(ranked), 1, -1)]
     sql = (
         "SELECT t.q FROM unnest($1::text[]) WITH ORDINALITY AS t(q, ord) "
         "WHERE EXISTS (SELECT 1 FROM messages "
