@@ -26,6 +26,8 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
+from chunking import CHUNK_MIN_CHARS, CHUNK_SIZE, split_chunks
+
 # --- config ---------------------------------------------------------------
 
 DB_DSN       = os.environ.get("ECHOES_DB_DSN",
@@ -78,6 +80,14 @@ ABSTAIN_ROWS = 12
 ABSTAIN_SNIPPET = 500
 ABSTAIN_TIMEOUT = 45
 
+# Index-time chunks (sql/005_chunks.sql, server/chunking.py). Both default OFF
+# so the flags can be measured apart: CHUNK_SEARCH changes which rows reach the
+# pool; JUDGE_CHUNK changes which 500 chars of a long row the judge reads.
+# Writes always chunk once the table exists, flags or not, so a later switch-on
+# finds new messages already indexed.
+CHUNK_SEARCH = os.environ.get("ECHOES_CHUNK_SEARCH", "0") not in ("0", "", "false")
+JUDGE_CHUNK  = os.environ.get("ECHOES_JUDGE_CHUNK", "0") not in ("0", "", "false")
+
 # --- models ---------------------------------------------------------------
 
 class MessageIn(BaseModel):
@@ -109,6 +119,11 @@ class SearchHit(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=5)
+    # A stack that never ran sql/005 keeps working exactly as before: no chunk
+    # writes, and the search flags are ignored rather than turned into 500s.
+    async with app.state.pool.acquire() as conn:
+        app.state.chunks = bool(await conn.fetchval(
+            "SELECT to_regclass('message_chunks') IS NOT NULL"))
     app.state.http = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=EMBED_TIMEOUT_S)
     )
@@ -336,6 +351,38 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
     return picked, "ok"
 
 
+def judge_snippet(r, q: str) -> str:
+    """The ABSTAIN_SNIPPET chars of a row the judge reads.
+
+    Default: the head. Measured 2026-09-19 (diag report 04): a long wrap-up
+    states its fact at char 4000+, the gold row was in the judge's 12 and it
+    still abstained, because none of the 12 heads showed the answer.
+
+    With JUDGE_CHUNK and a row that search reached through a chunk, the judge
+    reads the matched chunk instead: of its ABSTAIN_SNIPPET-sized windows, the
+    one holding the most query words, earliest on a tie. The window stays
+    inside CHUNK_SIZE of the chunk's start - a term window over the WHOLE
+    message was measured in report 04 and flips verdicts on merely on-topic
+    text.
+    """
+    content = r["content"] or ""
+    sc = r.get("matched_chunk") if JUDGE_CHUNK else None
+    if sc is None:
+        return content[:ABSTAIN_SNIPPET]
+    chunk = content[sc:sc + CHUNK_SIZE]
+    if len(chunk) <= ABSTAIN_SNIPPET:
+        return chunk
+    words = content_words(q)
+    low = chunk.lower()
+    best, best_hits = 0, -1
+    for s in range(0, len(chunk) - ABSTAIN_SNIPPET + 1, 50):
+        win = low[s:s + ABSTAIN_SNIPPET]
+        hits = sum(1 for w in words if w in win)
+        if hits > best_hits:
+            best, best_hits = s, hits
+    return chunk[best:best + ABSTAIN_SNIPPET]
+
+
 async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
     """Decide whether the corpus actually holds an answer. Returns (abstain, why).
 
@@ -376,7 +423,7 @@ async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
         return False, "no rows"
 
     ctx = "\n\n".join(
-        f"[{i+1}] {r['content'][:ABSTAIN_SNIPPET]}"
+        f"[{i+1}] {judge_snippet(r, q)}"
         for i, r in enumerate(rows[:ABSTAIN_ROWS])
     )
     prompt = (
@@ -432,11 +479,18 @@ async def write_message(msg: MessageIn):
     if not msg.content.strip():
         return {"skipped": True, "reason": "empty"}
 
-    emb = await embed_text(app.state.http, msg.content)
+    # Chunks embed concurrently with the message itself, so a long write costs
+    # about one embed of latency, not one per chunk.
+    chunks = split_chunks(msg.content) if app.state.chunks else []
+    emb, *chunk_embs = await asyncio.gather(
+        embed_text(app.state.http, msg.content),
+        *(embed_text(app.state.http, c) for _, c in chunks))
 
     # COALESCE so an omitted created_at still takes the column default. Passing
     # NULL explicitly would violate NOT NULL rather than fall back.
-    async with app.state.pool.acquire() as conn:
+    # One transaction, so a message is never visible without its chunks - under
+    # CHUNK_SEARCH a long message is searched ONLY through them.
+    async with app.state.pool.acquire() as conn, conn.transaction():
         if emb is not None:
             row = await conn.fetchrow(
                 """
@@ -458,6 +512,15 @@ async def write_message(msg: MessageIn):
                 """,
                 msg.session_id, msg.project, msg.machine, msg.role,
                 msg.content, msg.model, msg.created_at,
+            )
+        if row is not None and chunks:
+            await conn.executemany(
+                """
+                INSERT INTO message_chunks (message_id, ord, start_char, content, embedding)
+                VALUES ($1, $2, $3, $4, $5::vector)
+                """,
+                [(row["id"], i, s, c, e)
+                 for i, ((s, c), e) in enumerate(zip(chunks, chunk_embs))],
             )
 
     # DO NOTHING returns no row. That is a successful no-op, not a failure - a
@@ -534,6 +597,7 @@ async def search(
     idx = len(params) + 1
 
     do_rerank = rerank_ and RERANK_ENABLED
+    use_chunks = hybrid and CHUNK_SEARCH and app.state.chunks
     # Pull a deeper pool when re-ranking: the whole point is that the right
     # answer may sit below the RRF cut-off, so handing the model only the
     # top-`limit` rows would ask it to reorder a set the answer is not in.
@@ -609,6 +673,85 @@ async def search(
             WHERE embedding IS NOT NULL{where_extra}
             {("AND " + self_pred) if self_pred else ""}
             ORDER BY embedding <=> $1::vector
+            LIMIT {int(sql_limit)}
+        """
+    elif use_chunks:
+        # Each arm ranks over (short messages UNION chunks of long ones), then
+        # collapses to the parent by its best-ranked chunk. From there RRF,
+        # recency and the re-ranker run unchanged on parent messages.
+        #
+        # A long message with no chunk rows (a partial backfill) stays
+        # searchable whole, so switching the flag on early loses nothing.
+        #
+        # Chunks are over-fetched 3x because several can share a parent; the
+        # collapsed arm is cut back to `candidates` parents. Cosine distance and
+        # ts_rank are each comparable across the two sources (same embedder;
+        # ts_rank is unnormalised and chunks are short-message sized), so each
+        # arm merges its sources by raw score before ranking.
+        whole = (f"(length(content) <= {CHUNK_MIN_CHARS} OR NOT EXISTS "
+                 f"(SELECT 1 FROM message_chunks c WHERE c.message_id = messages.id))")
+        cand, cand_c = int(candidates), int(candidates) * 3
+        sql = f"""
+            WITH vec_raw AS (
+                (SELECT id AS mid, embedding <=> $1::vector AS d, NULL::int AS sc
+                 FROM messages
+                 WHERE embedding IS NOT NULL{where_extra} AND {whole}
+                 ORDER BY embedding <=> $1::vector
+                 LIMIT {cand})
+                UNION ALL
+                (SELECT c.message_id, c.embedding <=> $1::vector, c.start_char
+                 FROM message_chunks c JOIN messages m ON m.id = c.message_id
+                 WHERE c.embedding IS NOT NULL{where_extra}
+                 ORDER BY c.embedding <=> $1::vector
+                 LIMIT {cand_c})
+            ),
+            vec AS (
+                SELECT mid AS id, (array_agg(sc ORDER BY d))[1] AS sc,
+                       ROW_NUMBER() OVER (ORDER BY min(d)) AS rnk
+                FROM vec_raw GROUP BY mid
+                ORDER BY min(d) LIMIT {cand}
+            ),
+            lex_raw AS (
+                (SELECT id AS mid, NULL::int AS sc,
+                        ts_rank(to_tsvector('english', content),
+                                to_tsquery('english', $2)) AS r
+                 FROM messages
+                 WHERE to_tsvector('english', content)
+                       @@ to_tsquery('english', $2){where_extra} AND {whole}
+                 ORDER BY r DESC
+                 LIMIT {cand})
+                UNION ALL
+                (SELECT c.message_id, c.start_char,
+                        ts_rank(to_tsvector('english', c.content),
+                                to_tsquery('english', $2)) AS r
+                 FROM message_chunks c JOIN messages m ON m.id = c.message_id
+                 WHERE to_tsvector('english', c.content)
+                       @@ to_tsquery('english', $2){where_extra}
+                 ORDER BY r DESC
+                 LIMIT {cand_c})
+            ),
+            lex AS (
+                SELECT mid AS id, (array_agg(sc ORDER BY r DESC))[1] AS sc,
+                       ROW_NUMBER() OVER (ORDER BY max(r) DESC) AS rnk
+                FROM lex_raw GROUP BY mid
+                ORDER BY max(r) DESC LIMIT {cand}
+            ),
+            fused AS (
+                SELECT COALESCE(v.id, l.id) AS id,
+                       COALESCE(1.0 / (60 + v.rnk), 0)
+                     + COALESCE(1.0 / (60 + l.rnk), 0) AS score,
+                       CASE WHEN v.rnk IS NOT NULL AND (l.rnk IS NULL OR v.rnk <= l.rnk)
+                            THEN v.sc ELSE l.sc END AS matched_chunk
+                FROM vec v
+                FULL OUTER JOIN lex l ON v.id = l.id
+            )
+            SELECT m.id, m.session_id, m.project, m.role, m.content, m.model,
+                   m.source, m.created_at, f.score + {recency_term} AS score,
+                   f.matched_chunk
+            FROM fused f
+            JOIN messages m ON m.id = f.id
+            {("WHERE " + self_pred) if self_pred else ""}
+            ORDER BY score DESC, m.created_at DESC
             LIMIT {int(sql_limit)}
         """
     else:
@@ -730,7 +873,7 @@ async def search(
         "query": q,
         "abstained": abstained,
         "abstain": abstain_note,
-        "mode": "hybrid" if hybrid else "vector",
+        "mode": ("hybrid+chunks" if use_chunks else "hybrid") if hybrid else "vector",
         "lex_query": (params[1] if hybrid else None),
         "rerank": rank_note,
         "timings_ms": {"embed": round(_t_embed*1000), "probe": round(_t_probe*1000),
@@ -748,6 +891,7 @@ async def search(
                 "model": r["model"],
                 "created_at": r["created_at"].isoformat(),
                 "similarity": round(float(r["score"]), 4),
+                **({"matched_chunk": r["matched_chunk"]} if use_chunks else {}),
             }
             for r in rows
         ],
