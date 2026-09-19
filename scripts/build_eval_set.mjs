@@ -9,6 +9,7 @@
 // usage: node scripts/build_eval_set.mjs [--n=34]
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { ageInDays, temporalDays } from './temporal_window.mjs';
 
 const arg = (k, d) => (process.argv.find(a => a.startsWith(`--${k}=`)) || '').split('=')[1] || d;
 const N = Number(arg('n', 34));
@@ -64,14 +65,14 @@ for (const c of picked) {
 // Two directions, because a filter that silently ignores the constraint passes
 // the first and fails the second.
 for (const c of picked.slice(0, 10)) {
-  const ageDays = Math.max(1, Math.ceil((Date.now() - new Date(c.asked_at)) / 86400000));
+  const ageDays = ageInDays(c.asked_at);
   cases.push({
-    category: 'temporal_include', q: c.question, days: ageDays + 2,
+    category: 'temporal_include', q: c.question, days: temporalDays('temporal_include', ageDays),
     gold_ids: [c.gold_id], window_ids: windowOf.get(c.gold_id) || [c.gold_id],
     session_id: c.session_id, note: 'window contains the gold - it must still be found',
   });
   cases.push({
-    category: 'temporal_exclude', q: c.question, days: Math.max(1, Math.floor(ageDays / 3)),
+    category: 'temporal_exclude', q: c.question, days: temporalDays('temporal_exclude', ageDays),
     gold_ids: [c.gold_id], window_ids: [], expect_absent: true,
     session_id: c.session_id, note: 'window predates the gold - it must NOT be returned',
   });
