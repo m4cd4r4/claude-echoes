@@ -52,6 +52,7 @@ services:
       #   ECHOES_CHUNK_SEARCH=1 docker compose ... up -d server
       ECHOES_CHUNK_SEARCH: "${ECHOES_CHUNK_SEARCH:-0}"
       ECHOES_JUDGE_CHUNK: "${ECHOES_JUDGE_CHUNK:-0}"
+      ECHOES_RERANK_CHUNK: "${ECHOES_RERANK_CHUNK:-0}"
     depends_on:
       postgres:
         condition: service_healthy

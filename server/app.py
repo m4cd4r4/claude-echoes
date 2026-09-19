@@ -87,6 +87,9 @@ ABSTAIN_TIMEOUT = 45
 # finds new messages already indexed.
 CHUNK_SEARCH = os.environ.get("ECHOES_CHUNK_SEARCH", "0") not in ("0", "", "false")
 JUDGE_CHUNK  = os.environ.get("ECHOES_JUDGE_CHUNK", "0") not in ("0", "", "false")
+# RERANK_CHUNK: the re-ranker reads the matched chunk's best window instead of
+# the row's head. Only changes anything alongside CHUNK_SEARCH.
+RERANK_CHUNK = os.environ.get("ECHOES_RERANK_CHUNK", "0") not in ("0", "", "false")
 
 # --- models ---------------------------------------------------------------
 
@@ -305,7 +308,9 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
         return rows, "no candidates"
     lines = []
     for i, r in enumerate(rows):
-        body = " ".join((r["content"] or "").split())[:RERANK_SNIPPET]
+        # Window first, then whitespace-collapse: the chunk offset indexes the
+        # raw content, so collapsing first would shift it.
+        body = " ".join(chunk_window(r, q, RERANK_SNIPPET, RERANK_CHUNK).split())[:RERANK_SNIPPET]
         lines.append("[%d] (%s, %s) %s" % (i, r["role"], r["created_at"].strftime("%Y-%m-%d"), body))
     prompt = (
         "You rank past chat messages by how well they ANSWER a question.\n"
@@ -365,22 +370,29 @@ def judge_snippet(r, q: str) -> str:
     message was measured in report 04 and flips verdicts on merely on-topic
     text.
     """
+    return chunk_window(r, q, ABSTAIN_SNIPPET, JUDGE_CHUNK)
+
+
+def chunk_window(r, q: str, size: int, enabled: bool) -> str:
+    """`size` chars of a row: its head, or - when `enabled` and search reached
+    the row through a chunk - the size-char window inside the matched chunk
+    holding the most query words, earliest on a tie."""
     content = r["content"] or ""
-    sc = r.get("matched_chunk") if JUDGE_CHUNK else None
+    sc = r.get("matched_chunk") if enabled else None
     if sc is None:
-        return content[:ABSTAIN_SNIPPET]
+        return content[:size]
     chunk = content[sc:sc + CHUNK_SIZE]
-    if len(chunk) <= ABSTAIN_SNIPPET:
+    if len(chunk) <= size:
         return chunk
     words = content_words(q)
     low = chunk.lower()
     best, best_hits = 0, -1
-    for s in range(0, len(chunk) - ABSTAIN_SNIPPET + 1, 50):
-        win = low[s:s + ABSTAIN_SNIPPET]
+    for s in range(0, len(chunk) - size + 1, 50):
+        win = low[s:s + size]
         hits = sum(1 for w in words if w in win)
         if hits > best_hits:
             best, best_hits = s, hits
-    return chunk[best:best + ABSTAIN_SNIPPET]
+    return chunk[best:best + size]
 
 
 async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
