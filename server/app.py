@@ -57,6 +57,14 @@ RERANK_ENABLED = os.environ.get("ECHOES_RERANK", "1") not in ("0", "false", "Fal
 RERANK_POOL    = 24    # candidates handed to the model
 RERANK_SNIPPET = 420   # chars of each candidate the model sees
 RERANK_TIMEOUT = 60
+# Backend: "llm" = the qwen listwise call below; "ce" = a cross-encoder
+# (bge-reranker-v2-m3 on TEI, docker-compose.rerank.yml) that scores each
+# (question, snippet) pair. The cross-encoder is cheap per pair, so it reads a
+# longer snippet than the LLM prompt can afford.
+RERANK_BACKEND = os.environ.get("ECHOES_RERANK_BACKEND", "llm")
+CE_URL         = os.environ.get("ECHOES_CE_URL", "http://reranker:80")
+CE_SNIPPET     = int(os.environ.get("ECHOES_CE_SNIPPET", "1500"))
+CE_TIMEOUT     = 20
 
 # Recency tie-break. See the sizing note in /search before changing these.
 # HNSW recall. ef_search below the requested candidate count silently truncates
@@ -309,6 +317,8 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
     """
     if not rows:
         return rows, "no candidates"
+    if RERANK_BACKEND == "ce":
+        return await rerank_ce(http, q, rows)
     lines = []
     for i, r in enumerate(rows):
         # Window first, then whitespace-collapse: the chunk offset indexes the
@@ -357,6 +367,31 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
     # Anything it did not name keeps its RRF order behind what it did.
     picked += [r for i, r in enumerate(rows) if i not in seen]
     return picked, "ok"
+
+
+async def rerank_ce(http, q: str, rows: list) -> tuple:
+    """Cross-encoder re-rank: score every row against the question, sort by
+    score. Fails open to the incoming (RRF) order, same contract as rerank()."""
+    texts = [" ".join(chunk_window(r, q, CE_SNIPPET, RERANK_CHUNK).split())
+             for r in rows]
+    try:
+        async with http.post(
+            CE_URL + "/rerank",
+            json={"query": q, "texts": texts, "truncate": True},
+            timeout=aiohttp.ClientTimeout(total=CE_TIMEOUT),
+        ) as r:
+            if r.status != 200:
+                return rows, "ce http %d" % r.status
+            scored = await r.json()
+    except Exception as e:
+        return rows, "ce " + type(e).__name__
+    try:
+        order = [s["index"] for s in sorted(scored, key=lambda s: -s["score"])]
+    except Exception:
+        return rows, "ce unparseable"
+    if sorted(order) != list(range(len(rows))):
+        return rows, "ce bad indices"
+    return [rows[i] for i in order], "ok"
 
 
 def judge_snippet(r, q: str) -> str:

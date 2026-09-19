@@ -1,0 +1,32 @@
+# Optional cross-encoder re-ranker (bge-reranker-v2-m3 on Hugging Face TEI).
+#
+# Layer it on top of the GPU stack:
+#   ECHOES_RERANK_BACKEND=ce docker compose -f docker-compose.yml \
+#     -f docker-compose.gpu.yml -f docker-compose.rerank.yml up -d
+#
+# The server only calls it when ECHOES_RERANK_BACKEND=ce; otherwise the qwen
+# listwise re-ranker runs as before. The image tag is for Turing GPUs (compute
+# 7.5); other architectures need the matching TEI tag (cuda-*, 89-*, ...).
+services:
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:turing-1.8
+    container_name: echoes-reranker
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--max-batch-tokens", "16384"]
+    volumes:
+      - reranker_data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  server:
+    environment:
+      ECHOES_RERANK_BACKEND: "${ECHOES_RERANK_BACKEND:-llm}"
+      ECHOES_CE_URL: "http://reranker:80"
+
+volumes:
+  reranker_data:
