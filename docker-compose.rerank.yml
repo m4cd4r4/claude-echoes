@@ -11,7 +11,9 @@ services:
   reranker:
     image: ghcr.io/huggingface/text-embeddings-inference:turing-1.8
     container_name: echoes-reranker
-    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--max-batch-tokens", "16384"]
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--max-batch-tokens", "8192",
+               "--tokenization-workers", "4", "--max-concurrent-requests", "16"]
+    mem_limit: 5g
     volumes:
       - reranker_data:/data
     deploy:
