@@ -101,6 +101,10 @@ RERANK_CHUNK = os.environ.get("ECHOES_RERANK_CHUNK", "0") not in ("0", "", "fals
 # CHUNK_CAP: max parents per arm that may enter the pool through a chunk.
 # 0 = no cap. Measured 2026-09-19 because chunk rows crowded out whole hits.
 CHUNK_CAP    = int(os.environ.get("ECHOES_CHUNK_CAP", "0") or 0)
+# PAIR_GATE: abstain when a question names a subject AND a topic, both known to
+# the corpus, and no retrieved passage mentions both. The compositional-absence
+# case the judge is worst at - see pair_uncovered().
+PAIR_GATE    = os.environ.get("ECHOES_PAIR_GATE", "0") not in ("0", "", "false")
 
 # --- models ---------------------------------------------------------------
 
@@ -431,6 +435,82 @@ def chunk_window(r, q: str, size: int, enabled: bool) -> str:
         if hits > best_hits:
             best, best_hits = s, hits
     return chunk[best:best + size]
+
+
+# Cap on the document-frequency count. Only the RELATIVE rarity of the query's
+# words matters, so counting past this is work nobody reads.
+PAIR_DF_CAP = 5000
+
+def pair_terms(q: str) -> tuple:
+    """Split a question's content words into a named component and a topic
+    component. A capitalised token that is not the first word of the question
+    is treated as naming something - a client, a product, a place."""
+    toks = re.findall(r"[A-Za-z0-9_]+", q)
+    named = {w.lower() for w in toks[1:] if w[:1].isupper() and w[1:2].islower()}
+    ent, topic = [], []
+    for w in content_words(q):
+        (ent if w in named else topic).append(w)
+    return ent, topic
+
+
+async def pair_df(conn, words: list) -> dict:
+    """Document frequency of each word, counted through the FTS index."""
+    if not words:
+        return {}
+    rows = await conn.fetch(
+        "SELECT w, (SELECT count(*)::int FROM ("
+        "          SELECT 1 FROM messages"
+        "           WHERE to_tsvector('english', content)"
+        "                 @@ plainto_tsquery('english', w)"
+        f"          LIMIT {PAIR_DF_CAP}) z) AS n"
+        " FROM unnest($1::text[]) AS w", words)
+    return {r["w"]: r["n"] for r in rows}
+
+
+def pair_rarest(dfs: dict, words: list):
+    """The rarest of `words` that the corpus actually knows, or None. A word the
+    corpus has never seen carries no evidence either way, so it is skipped
+    rather than treated as proof of absence."""
+    known = [(w, dfs[w]) for w in words if dfs.get(w, 0) > 0]
+    return min(known, key=lambda x: x[1])[0] if known else None
+
+
+async def pair_uncovered(conn, q: str, rows) -> bool:
+    """True when the question is compositional and the corpus does not join it up.
+
+    WHY A SEPARATE GATE. judge_abstain() is deliberately lenient - it answers
+    YES on anything bearing on the question at all, because its one unacceptable
+    failure is inventing absence. That leniency is exactly what compositional
+    absence exploits: for 'the webhook work for <client>', passages about
+    webhooks ARE background, and passages mentioning the client ARE background,
+    so the judge answers even when the two were never discussed together.
+    Measured 2026-09-20 on the 15 generated compound cases: the judge alone
+    scores 0.333.
+
+    So decompose instead of persuading. Take the rarest named word and the
+    rarest topic word the corpus knows, and require ONE passage to contain both.
+    Neither component alone is evidence; their conjunction is.
+
+    Estimated 2026-09-20 over the case set before building: fires on 13 compound
+    cases for +8, +1 abstention, -2 single_session. The losses are real and are
+    the price - a gold passage that refers to its subject by a synonym is not
+    covered. Fails open on any DB error, same contract as the judge.
+    """
+    ent, topic = pair_terms(q)
+    if not ent or not topic or not rows:
+        return False
+    try:
+        dfs = await pair_df(conn, ent + topic)
+    except Exception:
+        return False
+    a, b = pair_rarest(dfs, ent), pair_rarest(dfs, topic)
+    if not a or not b:
+        return False
+    for r in rows[:ABSTAIN_ROWS]:
+        s = (r["content"] or "").lower()
+        if a in s and b in s:
+            return False
+    return True
 
 
 async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
@@ -906,6 +986,9 @@ async def search(
         rows = await conn.fetch(sql, *params)
         _t_sql = time.perf_counter() - _t1
         _t_probe = _t1 - _t0 - _t_embed
+        pair_gate_hit = (
+            await pair_uncovered(conn, q, rows)
+            if (abstain and ABSTAIN_ENABLED and PAIR_GATE) else False)
 
     # Abstain BEFORE re-ranking, deliberately. Measured 2026-09-10 on four
     # subjects SQL-verified absent from the index: judging the RRF order
@@ -918,7 +1001,10 @@ async def search(
     # answering, on precisely the queries where it should refuse.
     abstained, abstain_note = False, "off"
     _t_abstain = 0.0
-    if abstain and ABSTAIN_ENABLED:
+    if pair_gate_hit:
+        # Decided without the judge, so this also saves the judge call.
+        abstained, abstain_note = True, "pair gate: no passage mentions both"
+    elif abstain and ABSTAIN_ENABLED:
         _t3 = time.perf_counter()
         abstained, abstain_note = await judge_abstain(
             app.state.http, q, list(rows[:ABSTAIN_ROWS]))

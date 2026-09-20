@@ -54,6 +54,7 @@ services:
       ECHOES_JUDGE_CHUNK: "${ECHOES_JUDGE_CHUNK:-0}"
       ECHOES_RERANK_CHUNK: "${ECHOES_RERANK_CHUNK:-0}"
       ECHOES_CHUNK_CAP: "${ECHOES_CHUNK_CAP:-0}"
+      ECHOES_PAIR_GATE: "${ECHOES_PAIR_GATE:-0}"
     depends_on:
       postgres:
         condition: service_healthy
