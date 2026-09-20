@@ -190,10 +190,16 @@ If you have older Claude Code session logs in `~/.claude/daily-logs/` or any oth
 - ~2GB RAM for the base stack
 - **Base stack is CPU-only** — no GPU required for logging and search. On a
   modest VPS, embedding takes ~150ms per message.
-- **The LLM re-ranker needs a GPU.** It is `qwen2.5:7b-instruct`, and a 7B judge
-  on CPU is not viable; the 3B that would be measured *worse* than no re-ranker.
-  It ships OFF (`ECHOES_RERANK=0`) and is enabled by the GPU override — see
-  [docker-compose.gpu.yml](docker-compose.gpu.yml). A backfill of a large archive
+- **Re-ranking needs a GPU, and there are two backends.** The default is
+  `qwen2.5:7b-instruct` scoring the candidates listwise; a 7B judge on CPU is not
+  viable, and the 3B that would fit measured *worse* than no re-ranker. It ships
+  OFF (`ECHOES_RERANK=0`) and is enabled by the GPU override — see
+  [docker-compose.gpu.yml](docker-compose.gpu.yml). The recommended backend on a
+  GPU box is the **cross-encoder** (`bge-reranker-v2-m3` on Hugging Face TEI):
+  one scoring pass per candidate against the query instead of a listwise prompt,
+  which is a large latency saving with no retrieval cost measured on the local
+  eval set. Add [docker-compose.rerank.yml](docker-compose.rerank.yml) to the
+  `up` command to switch to it. A backfill of a large archive
   also wants the GPU: CPU embedding puts 108k messages at about 99 hours.
 
 ---

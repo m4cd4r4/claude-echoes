@@ -54,6 +54,9 @@ echo "==> re-ranker: OFF (base stack is CPU-only)"
 echo "    To enable it on an NVIDIA box:"
 echo "      docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d"
 echo "      docker compose exec ollama ollama pull qwen2.5:7b-instruct"
+echo "    Recommended on a GPU box: the cross-encoder backend instead of the"
+echo "    listwise LLM - much faster, no measured retrieval cost. Add:"
+echo "      -f docker-compose.rerank.yml"
 
 echo "==> waiting for server..."
 for i in {1..30}; do
