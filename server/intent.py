@@ -56,6 +56,11 @@ def project_key(name: str) -> str:
     return "".join(_tokens(name))
 
 
+def project_words(name: str) -> str:
+    """A project name as plain words: "BloodTracker-v2" -> "blood tracker v2"."""
+    return " ".join(_tokens(name))
+
+
 def build_project_index(projects, ignore=()) -> dict:
     """{key: project} for the names eligible to be matched from a question.
 
@@ -104,7 +109,7 @@ def lead_fingerprint(content: str, chars: int) -> str:
 
     Digits are masked so that templated text differing only in a date or a
     counter ("Date: 2026-04-20" vs "Date: 2026-04-21") collapses to one print.
-    Mirrored in SQL by app.AUTOMATION_SQL - keep the two in step."""
+    Mirrored in SQL by app._FP_INLINE and sql/006 - keep the three in step."""
     s = (content or "")[: chars + 40]
     s = re.sub(r"[0-9]", "#", s)
     s = re.sub(r"\s+", " ", s).strip(" ").lower()
@@ -135,7 +140,7 @@ def reorder(rows, boost_project=None, lift=0, demote=None) -> list:
     keyed = []
     for i, r in enumerate(rows):
         pos = i
-        if boost_project and r["project"] == boost_project:
+        if boost_project and lift > 0 and r["project"] == boost_project:
             pos -= lift + 0.5   # lands AHEAD of the row it now ties with
         if demote and demote(r):
             pos += back

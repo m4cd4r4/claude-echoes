@@ -55,6 +55,15 @@ services:
       ECHOES_RERANK_CHUNK: "${ECHOES_RERANK_CHUNK:-0}"
       ECHOES_CHUNK_CAP: "${ECHOES_CHUNK_CAP:-0}"
       ECHOES_PAIR_GATE: "${ECHOES_PAIR_GATE:-0}"
+      # Query intent (server/intent.py): answer "when did I last..." by date,
+      # boost a project named in the question, collapse templated duplicates,
+      # demote scripted user prompts. Off by default; each measured apart.
+      ECHOES_RECENCY_INTENT: "${ECHOES_RECENCY_INTENT:-0}"
+      ECHOES_PROJECT_RESOLVE: "${ECHOES_PROJECT_RESOLVE:-0}"
+      ECHOES_PROJECT_IGNORE: "${ECHOES_PROJECT_IGNORE:-}"
+      ECHOES_PROJECT_LIFT: "${ECHOES_PROJECT_LIFT:-0}"
+      ECHOES_DEDUPE: "${ECHOES_DEDUPE:-0}"
+      ECHOES_AUTOMATION_DEMOTE: "${ECHOES_AUTOMATION_DEMOTE:-0}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -27,6 +27,9 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from chunking import CHUNK_MIN_CHARS, CHUNK_SIZE, split_chunks
+from intent import (build_project_index, collapse_near_duplicates,
+                    lead_fingerprint, project_words, recency_intent, reorder,
+                    resolve_project)
 
 # --- config ---------------------------------------------------------------
 
@@ -65,6 +68,7 @@ RERANK_BACKEND = os.environ.get("ECHOES_RERANK_BACKEND", "llm")
 CE_URL         = os.environ.get("ECHOES_CE_URL", "http://reranker:80")
 CE_SNIPPET     = int(os.environ.get("ECHOES_CE_SNIPPET", "1500"))
 CE_TIMEOUT     = 20
+CE_BATCH       = 32    # TEI default --max-client-batch-size
 
 # Recency tie-break. See the sizing note in /search before changing these.
 # HNSW recall. ef_search below the requested candidate count silently truncates
@@ -105,6 +109,58 @@ CHUNK_CAP    = int(os.environ.get("ECHOES_CHUNK_CAP", "0") or 0)
 # the corpus, and no retrieved passage mentions both. The compositional-absence
 # case the judge is worst at - see pair_uncovered().
 PAIR_GATE    = os.environ.get("ECHOES_PAIR_GATE", "0") not in ("0", "", "false")
+
+# Query-intent handling (server/intent.py). Each is its own flag so a
+# regression can be pinned on one of them.
+#
+# RECENCY_INTENT: "when did I last...", "latest", "most recent" is answered by
+# date, not relevance. With a resolved project it returns that project's newest
+# sessions; without one it re-orders the relevant results newest first.
+RECENCY_INTENT = os.environ.get("ECHOES_RECENCY_INTENT", "0") not in ("0", "", "false")
+# PROJECT_RESOLVE: a project named in the question ("the billing service")
+# pulls that project's best matches into the candidate pool, so the re-ranker
+# can choose them, and a recency question about it is answered from it. A
+# boost, not a filter - an explicit project= param still filters.
+# PROJECT_LIFT additionally moves its rows up that many places AFTER the
+# re-ranker. Measured 2026-09-22 on the graded set (108 cases): lift 10 lost one
+# single_session case, lift 3 kept Recall@5 but cost MRR 0.601 -> 0.582, lift 0
+# (pool injection only) held both. So it defaults to 0.
+PROJECT_RESOLVE = os.environ.get("ECHOES_PROJECT_RESOLVE", "0") not in ("0", "", "false")
+PROJECT_LIFT    = int(os.environ.get("ECHOES_PROJECT_LIFT", "0"))
+PROJECT_POOL    = 10    # per arm, rows pulled from the resolved project
+PROJECT_TTL_S   = float(os.environ.get("ECHOES_PROJECT_CACHE_TTL", "300"))
+PROJECT_IGNORE  = [p.strip() for p in
+                   os.environ.get("ECHOES_PROJECT_IGNORE", "").split(",") if p.strip()]
+# DEDUPE: collapse results whose normalised leading text is identical, keeping
+# the best-ranked one. Templated messages otherwise fill a page with one answer.
+DEDUPE       = os.environ.get("ECHOES_DEDUPE", "0") not in ("0", "", "false")
+DEDUPE_CHARS = int(os.environ.get("ECHOES_DEDUPE_CHARS", "200"))
+# AUTOMATION_DEMOTE: a user-role message whose leading text is shared by
+# AUTOMATION_MIN_SESSIONS or more sessions is a scripted prompt (a headless
+# job, a pasted template), not something the person asked. Such rows go to the
+# back of the page.
+AUTOMATION_DEMOTE = os.environ.get("ECHOES_AUTOMATION_DEMOTE", "0") not in ("0", "", "false")
+AUTOMATION_MIN_SESSIONS = int(os.environ.get("ECHOES_AUTOMATION_MIN_SESSIONS", "5"))
+AUTOMATION_CHARS = 120
+AUTOMATION_MIN_LEN = 40   # a shared "continue" or "yes" is not automation
+AUTOMATION_TTL_S = 900
+# Mirrors intent.lead_fingerprint() and sql/006 - keep the three in step.
+# With sql/006 applied the prints live in message_fp; without it, they are
+# computed inline (correct, but ~15 s over ~60k user rows, so it runs in the
+# background cache refresh, never on the request path after the first load).
+_FP_INLINE = (
+    f"lower(left(btrim(regexp_replace(regexp_replace("
+    f"left(content, {AUTOMATION_CHARS + 40}), '[0-9]', '#', 'g'), "
+    f"'[[:space:]]+', ' ', 'g')), {AUTOMATION_CHARS}))")
+
+def automation_sql(stored: bool) -> str:
+    src = ("SELECT fp, session_id FROM message_fp" if stored else
+           f"SELECT {_FP_INLINE} AS fp, session_id FROM messages WHERE role = 'user'")
+    return f"""
+        SELECT fp FROM ({src}) t
+        WHERE length(fp) >= {AUTOMATION_MIN_LEN}
+        GROUP BY fp HAVING count(DISTINCT session_id) >= {AUTOMATION_MIN_SESSIONS}
+    """
 
 # --- models ---------------------------------------------------------------
 
@@ -155,6 +211,11 @@ async def lifespan(app: FastAPI):
             await embed_text(app.state.http, "warmup")
         except Exception:
             pass
+        # Load the intent caches now rather than on the first query.
+        if PROJECT_RESOLVE:
+            await _projects_cache.get(app.state.pool)
+        if AUTOMATION_DEMOTE:
+            await _automated_cache.get(app.state.pool)
         if RERANK_ENABLED:
             try:
                 async with app.state.http.post(
@@ -378,15 +439,19 @@ async def rerank_ce(http, q: str, rows: list) -> tuple:
     score. Fails open to the incoming (RRF) order, same contract as rerank()."""
     texts = [" ".join(chunk_window(r, q, CE_SNIPPET, RERANK_CHUNK).split())
              for r in rows]
+    # TEI refuses more than 32 texts per request (HTTP 413). Each pair is
+    # scored independently, so batching changes nothing but the request count.
+    scored = []
     try:
-        async with http.post(
-            CE_URL + "/rerank",
-            json={"query": q, "texts": texts, "truncate": True},
-            timeout=aiohttp.ClientTimeout(total=CE_TIMEOUT),
-        ) as r:
-            if r.status != 200:
-                return rows, "ce http %d" % r.status
-            scored = await r.json()
+        for off in range(0, len(texts), CE_BATCH):
+            async with http.post(
+                CE_URL + "/rerank",
+                json={"query": q, "texts": texts[off:off + CE_BATCH], "truncate": True},
+                timeout=aiohttp.ClientTimeout(total=CE_TIMEOUT),
+            ) as r:
+                if r.status != 200:
+                    return rows, "ce http %d" % r.status
+                scored += [{**s, "index": s["index"] + off} for s in await r.json()]
     except Exception as e:
         return rows, "ce " + type(e).__name__
     try:
@@ -511,6 +576,161 @@ async def pair_uncovered(conn, q: str, rows) -> bool:
         if a in s and b in s:
             return False
     return True
+
+
+class _Cached:
+    """A value refreshed from the DB at most every `ttl` seconds.
+
+    A stale value is served while ONE background task refreshes it, so a query
+    never waits on the refresh after the first load. `load` is awaited with a
+    pooled connection."""
+    def __init__(self, ttl: float, load, empty):
+        self.ttl, self.load, self.value = ttl, load, empty
+        self.at, self.task, self.loaded = 0.0, None, False
+
+    async def _refresh(self, pool):
+        try:
+            async with pool.acquire() as conn:
+                self.value = await self.load(conn)
+            self.loaded = True
+        except Exception:
+            pass   # keep serving the last good value
+        finally:
+            self.at = time.monotonic()
+
+    async def get(self, pool):
+        if not self.loaded:
+            # First use: nothing to serve yet, so wait (once) for the load.
+            if self.task is None or self.task.done():
+                self.task = asyncio.create_task(self._refresh(pool))
+            await self.task
+        elif time.monotonic() - self.at > self.ttl and (
+                self.task is None or self.task.done()):
+            self.task = asyncio.create_task(self._refresh(pool))
+        return self.value
+
+
+async def _load_projects(conn) -> dict:
+    # Busiest first, so a key shared by two spellings of one folder resolves
+    # to the one that holds the history.
+    rows = await conn.fetch(
+        "SELECT project, count(*)::int AS n FROM messages "
+        "GROUP BY project ORDER BY n DESC")
+    return {"index": build_project_index([r["project"] for r in rows], PROJECT_IGNORE),
+            "counts": {r["project"]: r["n"] for r in rows}}
+
+
+# A project named after an ordinary word ("search", "watch") matches questions
+# that are not about it at all. The corpus says which names are ordinary words:
+# one that appears in far more messages than the project itself holds is being
+# used as a word, not as a name. Measured 2026-09-22: a project called
+# "search" resolved from "how did we fix the HNSW ef_search recall problem".
+COMMON_RATIO = 5
+_common_names: dict = {}
+
+async def is_common_name(conn, project: str, own: int) -> bool:
+    if project in _common_names:
+        return _common_names[project]
+    cap = max(200, COMMON_RATIO * own) + 1
+    phrase = project_words(project)
+    try:
+        n = await conn.fetchval(
+            "SELECT count(*) FROM (SELECT 1 FROM messages "
+            " WHERE to_tsvector('english', content) @@ phraseto_tsquery('english', $1)"
+            f" LIMIT {cap}) z", phrase)
+    except Exception:
+        return False   # fail open: an unmeasured name keeps its boost
+    _common_names[project] = n >= cap
+    return _common_names[project]
+
+
+async def _load_automated(conn) -> frozenset:
+    stored = bool(await conn.fetchval("SELECT to_regclass('message_fp') IS NOT NULL"))
+    return frozenset(r["fp"] for r in await conn.fetch(automation_sql(stored)))
+
+
+_projects_cache  = _Cached(PROJECT_TTL_S, _load_projects, {"index": {}, "counts": {}})
+_automated_cache = _Cached(AUTOMATION_TTL_S, _load_automated, frozenset())
+
+
+async def project_rows(conn, qvec: str, lexq: str, project: str, extra_sql: str,
+                       extra_args: list) -> list:
+    """The resolved project's best matches: top PROJECT_POOL by vector and by
+    lexical rank, restricted to that project.
+
+    The main pool cannot be relied on to hold them. The HNSW index returns the
+    corpus-wide nearest rows and a project filter applied after it keeps almost
+    none of a small project, so the vector arm here orders by an EXPRESSION
+    (distance + 0) that the index cannot serve - Postgres then reads the
+    project's rows through idx_messages_project and sorts them exactly."""
+    cols = "id, session_id, project, role, content, model, source, created_at"
+    sql = f"""
+        (SELECT {cols}, 1 - (embedding <=> $1::vector) AS score
+         FROM messages
+         WHERE project = $3 AND embedding IS NOT NULL{extra_sql}
+         ORDER BY (embedding <=> $1::vector) + 0
+         LIMIT {PROJECT_POOL})
+        UNION
+        (SELECT {cols}, 0.0 AS score
+         FROM messages
+         WHERE project = $3
+           AND to_tsvector('english', content) @@ to_tsquery('english', $2){extra_sql}
+         ORDER BY ts_rank(to_tsvector('english', content),
+                          to_tsquery('english', $2)) DESC
+         LIMIT {PROJECT_POOL})
+    """
+    try:
+        return list(await conn.fetch(sql, qvec, lexq, project, *extra_args))
+    except Exception:
+        return []
+
+
+async def project_recent(conn, project: str, extra_sql: str, extra_args: list,
+                         limit: int, automated: frozenset) -> list:
+    """The project's newest sessions, newest first, one row per session.
+
+    The representative row is the session's LATEST substantive message (80+
+    chars, not a scripted prompt): for "when did I last work on X" the answer
+    is when the work stopped, and a closing message usually says what was done.
+    """
+    sql = f"""
+        WITH s AS (
+            SELECT session_id, max(created_at) AS last_at
+            FROM messages WHERE project = $1{extra_sql}
+            GROUP BY session_id
+            ORDER BY last_at DESC
+            LIMIT {int(limit) * 2}
+        )
+        SELECT * FROM (
+            SELECT m.id, m.session_id, m.project, m.role, m.content, m.model,
+                   m.source, m.created_at, 0.0 AS score, s.last_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY m.session_id
+                       ORDER BY (length(btrim(m.content)) >= 80) DESC,
+                                m.created_at DESC) AS rn
+            FROM messages m JOIN s ON s.session_id = m.session_id
+            WHERE m.project = $1{extra_sql}
+        ) t
+        WHERE rn <= 6   -- a few spares in case the latest is a scripted prompt
+        ORDER BY last_at DESC, session_id, rn
+    """
+    rows = await conn.fetch(sql, project, *extra_args)
+    out, cur, best = [], None, None
+    for r in rows:   # rows arrive grouped by session, best candidate first
+        if r["session_id"] != cur:
+            if best is not None:
+                out.append(best)
+            cur, best = r["session_id"], None
+        if best is None and not is_automated(r, automated):
+            best = r
+    if best is not None:
+        out.append(best)
+    return out[: int(limit)]
+
+
+def is_automated(r, automated: frozenset) -> bool:
+    return (r["role"] == "user" and bool(automated)
+            and lead_fingerprint(r["content"], AUTOMATION_CHARS) in automated)
 
 
 async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
@@ -711,6 +931,79 @@ async def search(
     if role and role not in ("user", "assistant"):
         raise HTTPException(400, "role must be 'user' or 'assistant'")
 
+    # Query intent (server/intent.py). An explicit project= always wins over a
+    # project resolved from the question text.
+    resolved = None
+    if PROJECT_RESOLVE and not project:
+        known = await _projects_cache.get(app.state.pool)
+        resolved = resolve_project(q, known["index"])
+        if resolved:
+            async with app.state.pool.acquire() as conn:
+                if await is_common_name(conn, resolved, known["counts"].get(resolved, 0)):
+                    resolved = None
+    target_project = project or resolved
+    want_recency = RECENCY_INTENT and recency_intent(q)
+    automated = (await _automated_cache.get(app.state.pool)
+                 if AUTOMATION_DEMOTE else frozenset())
+
+    def helper_filters(start: int) -> tuple:
+        """role/source/days as SQL for the project helpers, placeholders from
+        $start. The project itself is bound by the helper."""
+        c, a = [], []
+        for col, val in (("role", role), ("source", source)):
+            if val:
+                a.append(val); c.append(f"{col} = ${start + len(a) - 1}")
+        if days:
+            c.append(f"created_at > NOW() - INTERVAL '{int(days)} days'")
+        return ("".join(" AND " + x for x in c), a)
+
+    def is_self(r) -> bool:
+        # Python mirror of self_pred below.
+        body = re.sub(r"^/[a-z-]+\s+", "", (r["content"] or "").strip())
+        return body.lower() == q.strip().lower()
+
+    def hit(r) -> dict:
+        return {
+            "id": r["id"],
+            "session_id": r["session_id"],
+            "project": r["project"],
+            "role": r["role"],
+            "source": r["source"],
+            "content": r["content"],
+            "model": r["model"],
+            "created_at": r["created_at"].isoformat(),
+            "similarity": round(float(r["score"]), 4),
+            **({"matched_chunk": r.get("matched_chunk")} if use_chunks else {}),
+        }
+
+    if want_recency and target_project:
+        # "When did I last work on X" with X known: the answer is X's newest
+        # sessions, in date order. Relevance ranking cannot produce it - the
+        # rows that talk most about X are usually other projects mentioning it
+        # - and the judge is skipped because a project with history is, by
+        # definition, an answerable question.
+        use_chunks = False
+        _t1 = time.perf_counter()
+        extra_sql, extra_args = helper_filters(2)
+        async with app.state.pool.acquire() as conn:
+            rows = await project_recent(conn, target_project, extra_sql, extra_args,
+                                        int(limit) + 1, automated)
+        rows = [r for r in rows if not (drop_self and is_self(r))][: int(limit)]
+        return {
+            "query": q,
+            "abstained": False,
+            "abstain": "skipped (recency intent)",
+            "mode": "recency",
+            "intent": "recency",
+            "resolved_project": target_project,
+            "lex_query": None,
+            "rerank": "skipped (recency intent)",
+            "timings_ms": {"embed": round(_t_embed*1000),
+                           "sql": round((time.perf_counter() - _t1)*1000)},
+            "count": len(rows),
+            "results": [hit(r) for r in rows],
+        }
+
     # Filters are shared by both arms, so a project/role/days filter cannot
     # produce a hit from one arm that the other was never allowed to see.
     #
@@ -732,6 +1025,9 @@ async def search(
     # answer may sit below the RRF cut-off, so handing the model only the
     # top-`limit` rows would ask it to reorder a set the answer is not in.
     sql_limit = max(int(limit), RERANK_POOL) if do_rerank else int(limit)
+    if (DEDUPE or AUTOMATION_DEMOTE) and not do_rerank:
+        # Collapsing or demoting rows must not shorten the page.
+        sql_limit = int(limit) * 2
 
     # Recency prior, deliberately WEAK. Adjacent RRF ranks differ by about
     # 1/(60+n) - 1/(61+n) ~ 0.00026 near the top, so RECENCY_WEIGHT is sized at
@@ -989,6 +1285,16 @@ async def search(
         pair_gate_hit = (
             await pair_uncovered(conn, q, rows)
             if (abstain and ABSTAIN_ENABLED and PAIR_GATE) else False)
+        # A resolved project's own best matches, which the corpus-wide pool
+        # often holds none of. Fetched here but merged only AFTER the abstain
+        # decision below, so the pair gate and the judge see the same rows
+        # they always have.
+        extra_rows = []
+        if resolved:
+            extra_sql, extra_args = helper_filters(4)
+            extra_rows = await project_rows(
+                conn, qvec, params[1] if hybrid else "zzzz_no_lexical_match_zzzz",
+                resolved, extra_sql, extra_args)
 
     # Abstain BEFORE re-ranking, deliberately. Measured 2026-09-10 on four
     # subjects SQL-verified absent from the index: judging the RRF order
@@ -1016,38 +1322,42 @@ async def search(
         rows = []
         rank_note = "skipped (abstained)"
     else:
+        if extra_rows:
+            rows = list(rows)
+            have = {r["id"] for r in rows}
+            for r in extra_rows:   # a row found by both arms arrives twice
+                if r["id"] not in have and not (drop_self and is_self(r)):
+                    have.add(r["id"])
+                    rows.append(r)
         if do_rerank:
             _t2 = time.perf_counter()
             rows, rank_note = await rerank(app.state.http, q, list(rows), int(limit))
             _t_rank = time.perf_counter() - _t2
+        if DEDUPE:
+            rows = collapse_near_duplicates(rows, DEDUPE_CHARS)
+        if resolved or AUTOMATION_DEMOTE:
+            rows = reorder(
+                rows, boost_project=resolved, lift=PROJECT_LIFT,
+                demote=(lambda r: is_automated(r, automated)) if AUTOMATION_DEMOTE else None)
         rows = rows[: int(limit)]
+        if want_recency:
+            # No project to answer from: keep the relevant page, newest first.
+            rows = sorted(rows, key=lambda r: r["created_at"], reverse=True)
 
     return {
         "query": q,
         "abstained": abstained,
         "abstain": abstain_note,
         "mode": ("hybrid+chunks" if use_chunks else "hybrid") if hybrid else "vector",
+        "intent": "recency" if want_recency else "relevance",
+        "resolved_project": target_project,
         "lex_query": (params[1] if hybrid else None),
         "rerank": rank_note,
         "timings_ms": {"embed": round(_t_embed*1000), "probe": round(_t_probe*1000),
                        "sql": round(_t_sql*1000), "rerank": round(_t_rank*1000),
                        "abstain": round(_t_abstain*1000)},
         "count": len(rows),
-        "results": [
-            {
-                "id": r["id"],
-                "session_id": r["session_id"],
-                "project": r["project"],
-                "role": r["role"],
-                "source": r["source"],
-                "content": r["content"],
-                "model": r["model"],
-                "created_at": r["created_at"].isoformat(),
-                "similarity": round(float(r["score"]), 4),
-                **({"matched_chunk": r["matched_chunk"]} if use_chunks else {}),
-            }
-            for r in rows
-        ],
+        "results": [hit(r) for r in rows],
     }
 
 @app.get("/session/{session_id}")

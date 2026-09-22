@@ -1,6 +1,7 @@
 """Tests for server/intent.py. No dependencies: python server/test_intent.py"""
 from intent import (build_project_index, collapse_near_duplicates,
-                    lead_fingerprint, recency_intent, reorder, resolve_project)
+                    lead_fingerprint, project_words, recency_intent, reorder,
+                    resolve_project)
 
 PROJECTS = ["billing-service", "billing-service-refunds", "Temp", "scratchpad",
             ".claude", "Hard-Worker", "BloodTracker", "api-3.0", "knurl", "tool"]
@@ -40,6 +41,10 @@ def test_resolve_rejects_generic_and_partial():
     assert resolve_project("which tool", IDX) is None               # under 5 chars
     assert resolve_project("the knurled edge", IDX) is None          # whole tokens only
     assert resolve_project("knurl release", IDX) == "knurl"
+
+
+def test_project_words():
+    assert project_words("BloodTracker-v2") == "blood tracker v2"
 
 
 def test_fingerprint_masks_digits():
