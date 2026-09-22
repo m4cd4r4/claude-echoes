@@ -4,8 +4,8 @@ from intent import (build_project_index, collapse_near_duplicates,
                     resolve_project)
 
 PROJECTS = ["billing-service", "billing-service-refunds", "Temp", "scratchpad",
-            ".claude", "Hard-Worker", "BloodTracker", "api-3.0", "knurl", "tool"]
-IDX = build_project_index(PROJECTS, ignore=["Hard-Worker"])
+            ".claude", "Jo-Bloggs", "BloodTracker", "api-3.0", "gizmo", "tool"]
+IDX = build_project_index(PROJECTS, ignore=["Jo-Bloggs"])
 
 
 def test_recency_intent():
@@ -37,10 +37,10 @@ def test_resolve_rejects_generic_and_partial():
     assert resolve_project("save it in temp", IDX) is None           # ignore list
     assert resolve_project("my scratchpad notes", IDX) is None       # ignore list
     assert resolve_project("the .claude folder", IDX) is None        # hidden
-    assert resolve_project("I am a hard worker", IDX) is None        # caller ignore
+    assert resolve_project("ask jo bloggs", IDX) is None        # caller ignore
     assert resolve_project("which tool", IDX) is None               # under 5 chars
-    assert resolve_project("the knurled edge", IDX) is None          # whole tokens only
-    assert resolve_project("knurl release", IDX) == "knurl"
+    assert resolve_project("the gizmos edge", IDX) is None          # whole tokens only
+    assert resolve_project("gizmo release", IDX) == "gizmo"
 
 
 def test_project_words():

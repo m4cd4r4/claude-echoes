@@ -87,7 +87,7 @@ def resolve_project(q: str, index: dict):
     Matches WHOLE query tokens only: a contiguous run of the question's tokens,
     joined, must equal a project's key - so "billing service", "billing-
     service" and "Billing_Service" all resolve, while a project called
-    "knurl" never matches inside "knurled". The longest match wins, so a
+    "gizmo" never matches inside "gizmos". The longest match wins, so a
     question naming "billing-service-refunds" resolves to that and not to
     "billing-service"."""
     toks = _tokens(q)
