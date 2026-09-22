@@ -14,6 +14,7 @@
 //
 // usage: node scripts/eval_graded.mjs [baseUrl] [--k=5] [--rerank=1] [--cases=F]
 import { readFileSync, writeFileSync } from 'node:fs';
+import { ageInDays, temporalDays } from './temporal_window.mjs';
 
 const arg = (k, d) => (process.argv.find(a => a.startsWith(`--${k}=`)) || '').split('=')[1] ?? d;
 const BASE   = process.argv[2]?.startsWith('http') ? process.argv[2] : 'http://127.0.0.1:8088';
@@ -36,7 +37,13 @@ async function search(params) {
       const r = await fetch(`${BASE}/search?${params}`, { signal: AbortSignal.timeout(120000) });
       const j = await r.json();
       if (j.detail) { lastErr = JSON.stringify(j.detail).slice(0, 90); }
-      else return { rows: j.results || [], err: '' };
+      else {
+        // Both model stages fail OPEN, so a timed-out stage still returns rows.
+        // Count every non-ok note: a run with any of these is not a valid number.
+        if (RERANK && j.rerank !== 'ok' && !j.abstained) failOpen.push(`rerank: ${j.rerank}`);
+        if (/^judge (http|unavailable|unparseable)/.test(j.abstain || '')) failOpen.push(j.abstain);
+        return { rows: j.results || [], err: '' };
+      }
     } catch (e) { lastErr = e.message; }
     // Back off and let the stack come back up before giving the case away.
     await sleep(attempt * 5000);
@@ -44,6 +51,24 @@ async function search(params) {
   return { rows: [], err: lastErr };
 }
 
+// The stored `days` on a temporal case is only what it was on build day. Date the
+// gold row now and derive the window from its real age, or the case measures
+// the calendar instead of the filter.
+const sessionCache = new Map();
+async function goldCreatedAt(c) {
+  if (!c.session_id || !(c.gold_ids || []).length) return null;
+  if (!sessionCache.has(c.session_id)) {
+    try {
+      const r = await fetch(`${BASE}/session/${encodeURIComponent(c.session_id)}?limit=100000`,
+        { signal: AbortSignal.timeout(60000) });
+      sessionCache.set(c.session_id, (await r.json()).messages || []);
+    } catch { sessionCache.set(c.session_id, []); }
+  }
+  const row = sessionCache.get(c.session_id).find(m => m.id === c.gold_ids[0]);
+  return row ? row.created_at : null;
+}
+
+const failOpen = [];
 const stats = {};
 const bump = (cat) => (stats[cat] ??= { n: 0, hit: 0, win: 0, rr: 0, ndcg: 0, ms: 0, err: 0 });
 const rowsOut = [];
@@ -54,7 +79,17 @@ for (const c of CASES) {
   if (!RERANK) params.set('rerank', 'false');
   if (!RECENCY) params.set('recency', 'false');
   if (!DROP_SELF) params.set('drop_self', 'false');
-  if (c.days) params.set('days', String(c.days));
+  if (c.days) {
+    const at = await goldCreatedAt(c);
+    if (!at) {
+      s.err++;
+      console.log(`ERROR  ${c.category.padEnd(17)}  ${c.q.slice(0, 62)} | gold row not found, cannot date the window`);
+      rowsOut.push({ ...c, error: 'gold row not found' });
+      continue;
+    }
+    c.days = temporalDays(c.category, ageInDays(at));
+    params.set('days', String(c.days));
+  }
   // The query text for a gold-bearing case IS the user's own turn, and that row
   // is in the index: it embeds at cosine 1.0 and carries every lexical term, so
   // it takes RRF rank 1 in every such case and gold can never place better than
@@ -86,15 +121,26 @@ for (const c of CASES) {
     continue;
   }
 
-  const hitRanks = ids.map((id, i) => (gold.has(id) ? i + 1 : 0)).filter(Boolean);
-  const recall = gold.size ? hitRanks.length / Math.min(gold.size, K) : 0;
+  // A multi_session case with gold_session_of counts distinct SESSIONS: its gold
+  // is every matching row of every qualifying session, so two rows from one
+  // session are one hit, and the ceiling is the session count, not the row count.
+  const sessOf = c.gold_session_of || null;
+  const seen = new Set();
+  const hitRanks = ids.map((id, i) => {
+    if (!gold.has(id)) return 0;
+    if (sessOf) { const sid = sessOf[id]; if (seen.has(sid)) return 0; seen.add(sid); }
+    return i + 1;
+  }).filter(Boolean);
+  const goldUnits = sessOf ? new Set(Object.values(sessOf)).size : gold.size;
+  const recall = goldUnits ? hitRanks.length / Math.min(goldUnits, K) : 0;
   const firstRank = hitRanks[0] || 0;
 
   if (hitRanks.length) { s.hit += recall; s.rr += 1 / firstRank; }
   const inWindow = ids.some(i => win.has(i));
   if (inWindow) s.win++;
-  const ideal = dcg(Array(Math.min(gold.size, K)).fill(1));
-  s.ndcg += ideal ? dcg(ids.map(id => (gold.has(id) ? 1 : 0))) / ideal : 0;
+  const ideal = dcg(Array(Math.min(goldUnits, K)).fill(1));
+  const hitSet = new Set(hitRanks);
+  s.ndcg += ideal ? dcg(ids.map((_, i) => (hitSet.has(i + 1) ? 1 : 0))) / ideal : 0;
 
   const mark = firstRank ? `PASS @${firstRank}` : (inWindow ? 'WIN  ~ ' : 'FAIL   ');
   console.log(`${mark} ${c.category.padEnd(17)} ${String(rows.length).padStart(2)} rows  ${c.q.slice(0, 62)}`);
@@ -110,4 +156,5 @@ for (const [cat, s] of Object.entries(stats)) {
 }
 if (tot.n) console.log(`${'OVERALL'.padEnd(18)} ${String(tot.n).padStart(3)} ${String(tot.err).padStart(4)}   ${(tot.hit/tot.n).toFixed(3)}   ${(tot.rr/tot.n).toFixed(3)}   ${(tot.ndcg/tot.n).toFixed(3)}   ${(tot.win/tot.n).toFixed(3)}  ${String(Math.round(tot.ms/tot.n)).padStart(6)}`);
 if (tot.err) console.log(`\n${tot.err} case(s) errored after retries and are EXCLUDED from every figure above.`);
+console.log(`\nfail-open model calls: ${failOpen.length}${failOpen.length ? '  -> RUN INVALID: ' + [...new Set(failOpen)].join(' | ') : ''}`);
 if (OUT) writeFileSync(OUT, JSON.stringify(rowsOut, null, 2) + '\n');

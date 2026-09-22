@@ -26,6 +26,8 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
+from chunking import CHUNK_MIN_CHARS, CHUNK_SIZE, split_chunks
+
 # --- config ---------------------------------------------------------------
 
 DB_DSN       = os.environ.get("ECHOES_DB_DSN",
@@ -55,6 +57,14 @@ RERANK_ENABLED = os.environ.get("ECHOES_RERANK", "1") not in ("0", "false", "Fal
 RERANK_POOL    = 24    # candidates handed to the model
 RERANK_SNIPPET = 420   # chars of each candidate the model sees
 RERANK_TIMEOUT = 60
+# Backend: "llm" = the qwen listwise call below; "ce" = a cross-encoder
+# (bge-reranker-v2-m3 on TEI, docker-compose.rerank.yml) that scores each
+# (question, snippet) pair. The cross-encoder is cheap per pair, so it reads a
+# longer snippet than the LLM prompt can afford.
+RERANK_BACKEND = os.environ.get("ECHOES_RERANK_BACKEND", "llm")
+CE_URL         = os.environ.get("ECHOES_CE_URL", "http://reranker:80")
+CE_SNIPPET     = int(os.environ.get("ECHOES_CE_SNIPPET", "1500"))
+CE_TIMEOUT     = 20
 
 # Recency tie-break. See the sizing note in /search before changing these.
 # HNSW recall. ef_search below the requested candidate count silently truncates
@@ -77,6 +87,24 @@ ABSTAIN_ENABLED = os.environ.get("ECHOES_ABSTAIN", "0") not in ("0", "", "false"
 ABSTAIN_ROWS = 12
 ABSTAIN_SNIPPET = 500
 ABSTAIN_TIMEOUT = 45
+
+# Index-time chunks (sql/005_chunks.sql, server/chunking.py). Both default OFF
+# so the flags can be measured apart: CHUNK_SEARCH changes which rows reach the
+# pool; JUDGE_CHUNK changes which 500 chars of a long row the judge reads.
+# Writes always chunk once the table exists, flags or not, so a later switch-on
+# finds new messages already indexed.
+CHUNK_SEARCH = os.environ.get("ECHOES_CHUNK_SEARCH", "0") not in ("0", "", "false")
+JUDGE_CHUNK  = os.environ.get("ECHOES_JUDGE_CHUNK", "0") not in ("0", "", "false")
+# RERANK_CHUNK: the re-ranker reads the matched chunk's best window instead of
+# the row's head. Only changes anything alongside CHUNK_SEARCH.
+RERANK_CHUNK = os.environ.get("ECHOES_RERANK_CHUNK", "0") not in ("0", "", "false")
+# CHUNK_CAP: max parents per arm that may enter the pool through a chunk.
+# 0 = no cap. Measured 2026-09-19 because chunk rows crowded out whole hits.
+CHUNK_CAP    = int(os.environ.get("ECHOES_CHUNK_CAP", "0") or 0)
+# PAIR_GATE: abstain when a question names a subject AND a topic, both known to
+# the corpus, and no retrieved passage mentions both. The compositional-absence
+# case the judge is worst at - see pair_uncovered().
+PAIR_GATE    = os.environ.get("ECHOES_PAIR_GATE", "0") not in ("0", "", "false")
 
 # --- models ---------------------------------------------------------------
 
@@ -109,6 +137,11 @@ class SearchHit(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=5)
+    # A stack that never ran sql/005 keeps working exactly as before: no chunk
+    # writes, and the search flags are ignored rather than turned into 500s.
+    async with app.state.pool.acquire() as conn:
+        app.state.chunks = bool(await conn.fetchval(
+            "SELECT to_regclass('message_chunks') IS NOT NULL"))
     app.state.http = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=EMBED_TIMEOUT_S)
     )
@@ -189,7 +222,31 @@ _STOP = {
     "me","much","my","of","on","or","our","should","so","tell","that","the","their",
     "them","then","there","these","this","to","was","we","were","what","when","where",
     "which","who","why","will","with","would","you","your","actually","really","just",
+    # Question-template verbs. Left in, they become REQUIRED terms in the AND:
+    # "tailwind & config & server" matched 20 rows, "+ learn" matched 1.
+    "know","knew","learn","learned","learnt","find","decide","decided",
+    "happen","happened","about","go","went","can","could","may","might","must",
 }
+
+
+def lex_term(w: str) -> str:
+    """One content word as a tsquery term, covering the english stemmer's
+    y->i split.
+
+    "certified" stems to certifi but "certification" to certif, so an exact
+    AND on the question's stem dropped the only row that held the answer. A
+    word with a y->i ending (-ied, -ies, -y) matches either stem.
+
+    General prefix matching (every term as "word:*") was measured and rejected
+    2026-09-19: it gained one single_session case but pushed multi_session
+    gold down and lowered temporal MRR - broad prefixes are lexical noise.
+    """
+    base = None
+    if len(w) > 5 and (w.endswith("ied") or w.endswith("ies")):
+        base = w[:-3]
+    elif len(w) > 5 and w.endswith("y"):
+        base = w[:-1]
+    return f"({base} | {w})" if base else w
 
 def content_words(q: str) -> list:
     """Query words with stopwords and question words dropped, deduped, and
@@ -234,7 +291,8 @@ async def pick_lex_query(conn, q: str, where_sql: str, where_args: list) -> Opti
     if not words:
         return None
     ranked = sorted(words, key=len, reverse=True)
-    tiers = [" & ".join(ranked[:k]) for k in range(len(ranked), 1, -1)]
+    tiers = [" & ".join(lex_term(w) for w in ranked[:k])
+             for k in range(len(ranked), 1, -1)]
     sql = (
         "SELECT t.q FROM unnest($1::text[]) WITH ORDINALITY AS t(q, ord) "
         "WHERE EXISTS (SELECT 1 FROM messages "
@@ -263,9 +321,13 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
     """
     if not rows:
         return rows, "no candidates"
+    if RERANK_BACKEND == "ce":
+        return await rerank_ce(http, q, rows)
     lines = []
     for i, r in enumerate(rows):
-        body = " ".join((r["content"] or "").split())[:RERANK_SNIPPET]
+        # Window first, then whitespace-collapse: the chunk offset indexes the
+        # raw content, so collapsing first would shift it.
+        body = " ".join(chunk_window(r, q, RERANK_SNIPPET, RERANK_CHUNK).split())[:RERANK_SNIPPET]
         lines.append("[%d] (%s, %s) %s" % (i, r["role"], r["created_at"].strftime("%Y-%m-%d"), body))
     prompt = (
         "You rank past chat messages by how well they ANSWER a question.\n"
@@ -311,6 +373,146 @@ async def rerank(http, q: str, rows: list, want: int) -> tuple:
     return picked, "ok"
 
 
+async def rerank_ce(http, q: str, rows: list) -> tuple:
+    """Cross-encoder re-rank: score every row against the question, sort by
+    score. Fails open to the incoming (RRF) order, same contract as rerank()."""
+    texts = [" ".join(chunk_window(r, q, CE_SNIPPET, RERANK_CHUNK).split())
+             for r in rows]
+    try:
+        async with http.post(
+            CE_URL + "/rerank",
+            json={"query": q, "texts": texts, "truncate": True},
+            timeout=aiohttp.ClientTimeout(total=CE_TIMEOUT),
+        ) as r:
+            if r.status != 200:
+                return rows, "ce http %d" % r.status
+            scored = await r.json()
+    except Exception as e:
+        return rows, "ce " + type(e).__name__
+    try:
+        order = [s["index"] for s in sorted(scored, key=lambda s: -s["score"])]
+    except Exception:
+        return rows, "ce unparseable"
+    if sorted(order) != list(range(len(rows))):
+        return rows, "ce bad indices"
+    return [rows[i] for i in order], "ok"
+
+
+def judge_snippet(r, q: str) -> str:
+    """The ABSTAIN_SNIPPET chars of a row the judge reads.
+
+    Default: the head. Measured 2026-09-19 (diag report 04): a long wrap-up
+    states its fact at char 4000+, the gold row was in the judge's 12 and it
+    still abstained, because none of the 12 heads showed the answer.
+
+    With JUDGE_CHUNK and a row that search reached through a chunk, the judge
+    reads the matched chunk instead: of its ABSTAIN_SNIPPET-sized windows, the
+    one holding the most query words, earliest on a tie. The window stays
+    inside CHUNK_SIZE of the chunk's start - a term window over the WHOLE
+    message was measured in report 04 and flips verdicts on merely on-topic
+    text.
+    """
+    return chunk_window(r, q, ABSTAIN_SNIPPET, JUDGE_CHUNK)
+
+
+def chunk_window(r, q: str, size: int, enabled: bool) -> str:
+    """`size` chars of a row: its head, or - when `enabled` and search reached
+    the row through a chunk - the size-char window inside the matched chunk
+    holding the most query words, earliest on a tie."""
+    content = r["content"] or ""
+    sc = r.get("matched_chunk") if enabled else None
+    if sc is None:
+        return content[:size]
+    chunk = content[sc:sc + CHUNK_SIZE]
+    if len(chunk) <= size:
+        return chunk
+    words = content_words(q)
+    low = chunk.lower()
+    best, best_hits = 0, -1
+    for s in range(0, len(chunk) - size + 1, 50):
+        win = low[s:s + size]
+        hits = sum(1 for w in words if w in win)
+        if hits > best_hits:
+            best, best_hits = s, hits
+    return chunk[best:best + size]
+
+
+# Cap on the document-frequency count. Only the RELATIVE rarity of the query's
+# words matters, so counting past this is work nobody reads.
+PAIR_DF_CAP = 5000
+
+def pair_terms(q: str) -> tuple:
+    """Split a question's content words into a named component and a topic
+    component. A capitalised token that is not the first word of the question
+    is treated as naming something - a client, a product, a place."""
+    toks = re.findall(r"[A-Za-z0-9_]+", q)
+    named = {w.lower() for w in toks[1:] if w[:1].isupper() and w[1:2].islower()}
+    ent, topic = [], []
+    for w in content_words(q):
+        (ent if w in named else topic).append(w)
+    return ent, topic
+
+
+async def pair_df(conn, words: list) -> dict:
+    """Document frequency of each word, counted through the FTS index."""
+    if not words:
+        return {}
+    rows = await conn.fetch(
+        "SELECT w, (SELECT count(*)::int FROM ("
+        "          SELECT 1 FROM messages"
+        "           WHERE to_tsvector('english', content)"
+        "                 @@ plainto_tsquery('english', w)"
+        f"          LIMIT {PAIR_DF_CAP}) z) AS n"
+        " FROM unnest($1::text[]) AS w", words)
+    return {r["w"]: r["n"] for r in rows}
+
+
+def pair_rarest(dfs: dict, words: list):
+    """The rarest of `words` that the corpus actually knows, or None. A word the
+    corpus has never seen carries no evidence either way, so it is skipped
+    rather than treated as proof of absence."""
+    known = [(w, dfs[w]) for w in words if dfs.get(w, 0) > 0]
+    return min(known, key=lambda x: x[1])[0] if known else None
+
+
+async def pair_uncovered(conn, q: str, rows) -> bool:
+    """True when the question is compositional and the corpus does not join it up.
+
+    WHY A SEPARATE GATE. judge_abstain() is deliberately lenient - it answers
+    YES on anything bearing on the question at all, because its one unacceptable
+    failure is inventing absence. That leniency is exactly what compositional
+    absence exploits: for 'the webhook work for <client>', passages about
+    webhooks ARE background, and passages mentioning the client ARE background,
+    so the judge answers even when the two were never discussed together.
+    Measured 2026-09-20 on the 15 generated compound cases: the judge alone
+    scores 0.333.
+
+    So decompose instead of persuading. Take the rarest named word and the
+    rarest topic word the corpus knows, and require ONE passage to contain both.
+    Neither component alone is evidence; their conjunction is.
+
+    Estimated 2026-09-20 over the case set before building: fires on 13 compound
+    cases for +8, +1 abstention, -2 single_session. The losses are real and are
+    the price - a gold passage that refers to its subject by a synonym is not
+    covered. Fails open on any DB error, same contract as the judge.
+    """
+    ent, topic = pair_terms(q)
+    if not ent or not topic or not rows:
+        return False
+    try:
+        dfs = await pair_df(conn, ent + topic)
+    except Exception:
+        return False
+    a, b = pair_rarest(dfs, ent), pair_rarest(dfs, topic)
+    if not a or not b:
+        return False
+    for r in rows[:ABSTAIN_ROWS]:
+        s = (r["content"] or "").lower()
+        if a in s and b in s:
+            return False
+    return True
+
+
 async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
     """Decide whether the corpus actually holds an answer. Returns (abstain, why).
 
@@ -351,7 +553,7 @@ async def judge_abstain(session, q: str, rows) -> tuple[bool, str]:
         return False, "no rows"
 
     ctx = "\n\n".join(
-        f"[{i+1}] {r['content'][:ABSTAIN_SNIPPET]}"
+        f"[{i+1}] {judge_snippet(r, q)}"
         for i, r in enumerate(rows[:ABSTAIN_ROWS])
     )
     prompt = (
@@ -407,11 +609,18 @@ async def write_message(msg: MessageIn):
     if not msg.content.strip():
         return {"skipped": True, "reason": "empty"}
 
-    emb = await embed_text(app.state.http, msg.content)
+    # Chunks embed concurrently with the message itself, so a long write costs
+    # about one embed of latency, not one per chunk.
+    chunks = split_chunks(msg.content) if app.state.chunks else []
+    emb, *chunk_embs = await asyncio.gather(
+        embed_text(app.state.http, msg.content),
+        *(embed_text(app.state.http, c) for _, c in chunks))
 
     # COALESCE so an omitted created_at still takes the column default. Passing
     # NULL explicitly would violate NOT NULL rather than fall back.
-    async with app.state.pool.acquire() as conn:
+    # One transaction, so a message is never visible without its chunks - under
+    # CHUNK_SEARCH a long message is searched ONLY through them.
+    async with app.state.pool.acquire() as conn, conn.transaction():
         if emb is not None:
             row = await conn.fetchrow(
                 """
@@ -433,6 +642,15 @@ async def write_message(msg: MessageIn):
                 """,
                 msg.session_id, msg.project, msg.machine, msg.role,
                 msg.content, msg.model, msg.created_at,
+            )
+        if row is not None and chunks:
+            await conn.executemany(
+                """
+                INSERT INTO message_chunks (message_id, ord, start_char, content, embedding)
+                VALUES ($1, $2, $3, $4, $5::vector)
+                """,
+                [(row["id"], i, s, c, e)
+                 for i, ((s, c), e) in enumerate(zip(chunks, chunk_embs))],
             )
 
     # DO NOTHING returns no row. That is a successful no-op, not a failure - a
@@ -509,6 +727,7 @@ async def search(
     idx = len(params) + 1
 
     do_rerank = rerank_ and RERANK_ENABLED
+    use_chunks = hybrid and CHUNK_SEARCH and app.state.chunks
     # Pull a deeper pool when re-ranking: the whole point is that the right
     # answer may sit below the RRF cut-off, so handing the model only the
     # top-`limit` rows would ask it to reorder a set the answer is not in.
@@ -584,6 +803,102 @@ async def search(
             WHERE embedding IS NOT NULL{where_extra}
             {("AND " + self_pred) if self_pred else ""}
             ORDER BY embedding <=> $1::vector
+            LIMIT {int(sql_limit)}
+        """
+    elif use_chunks:
+        # Each arm ranks over (short messages UNION chunks of long ones), then
+        # collapses to the parent by its best-ranked chunk. From there RRF,
+        # recency and the re-ranker run unchanged on parent messages.
+        #
+        # A long message with no chunk rows (a partial backfill) stays
+        # searchable whole, so switching the flag on early loses nothing.
+        #
+        # Chunks are over-fetched 3x because several can share a parent; the
+        # collapsed arm is cut back to `candidates` parents. Cosine distance and
+        # ts_rank are each comparable across the two sources (same embedder;
+        # ts_rank is unnormalised and chunks are short-message sized), so each
+        # arm merges its sources by raw score before ranking.
+        whole = (f"(length(content) <= {CHUNK_MIN_CHARS} OR NOT EXISTS "
+                 f"(SELECT 1 FROM message_chunks c WHERE c.message_id = messages.id))")
+        cand, cand_c = int(candidates), int(candidates) * 3
+
+        def collapse(raw: str, key: str, best: str) -> str:
+            # Parent rows of one arm: best entry per parent, ranked by `best`.
+            # With CHUNK_CAP > 0, at most CHUNK_CAP parents may come from a
+            # chunk, so short/whole messages keep the rest of the pool.
+            if CHUNK_CAP <= 0:
+                return f"""
+                SELECT mid AS id, (array_agg(sc ORDER BY {key}))[1] AS sc,
+                       ROW_NUMBER() OVER (ORDER BY {best}) AS rnk
+                FROM {raw} GROUP BY mid
+                ORDER BY {best} LIMIT {cand}"""
+            return f"""
+                SELECT id, sc, ROW_NUMBER() OVER (ORDER BY b) AS rnk
+                FROM (
+                    SELECT id, sc, b, ROW_NUMBER() OVER (
+                               PARTITION BY sc IS NULL ORDER BY b) AS src_rn
+                    FROM (
+                        SELECT mid AS id, (array_agg(sc ORDER BY {key}))[1] AS sc,
+                               {best} AS b
+                        FROM {raw} GROUP BY mid
+                    ) g
+                ) h
+                WHERE sc IS NULL OR src_rn <= {CHUNK_CAP}
+                ORDER BY b LIMIT {cand}"""
+
+        sql = f"""
+            WITH vec_raw AS (
+                (SELECT id AS mid, embedding <=> $1::vector AS d, NULL::int AS sc
+                 FROM messages
+                 WHERE embedding IS NOT NULL{where_extra} AND {whole}
+                 ORDER BY embedding <=> $1::vector
+                 LIMIT {cand})
+                UNION ALL
+                (SELECT c.message_id, c.embedding <=> $1::vector, c.start_char
+                 FROM message_chunks c JOIN messages m ON m.id = c.message_id
+                 WHERE c.embedding IS NOT NULL{where_extra}
+                 ORDER BY c.embedding <=> $1::vector
+                 LIMIT {cand_c})
+            ),
+            vec AS ({collapse('vec_raw', 'd', 'min(d)')}
+            ),
+            lex_raw AS (
+                (SELECT id AS mid, NULL::int AS sc,
+                        ts_rank(to_tsvector('english', content),
+                                to_tsquery('english', $2)) AS r
+                 FROM messages
+                 WHERE to_tsvector('english', content)
+                       @@ to_tsquery('english', $2){where_extra} AND {whole}
+                 ORDER BY r DESC
+                 LIMIT {cand})
+                UNION ALL
+                (SELECT c.message_id, c.start_char,
+                        ts_rank(to_tsvector('english', c.content),
+                                to_tsquery('english', $2)) AS r
+                 FROM message_chunks c JOIN messages m ON m.id = c.message_id
+                 WHERE to_tsvector('english', c.content)
+                       @@ to_tsquery('english', $2){where_extra}
+                 ORDER BY r DESC
+                 LIMIT {cand_c})
+            ),
+            lex AS ({collapse('lex_raw', 'r DESC', '-max(r)')}
+            ),
+            fused AS (
+                SELECT COALESCE(v.id, l.id) AS id,
+                       COALESCE(1.0 / (60 + v.rnk), 0)
+                     + COALESCE(1.0 / (60 + l.rnk), 0) AS score,
+                       CASE WHEN v.rnk IS NOT NULL AND (l.rnk IS NULL OR v.rnk <= l.rnk)
+                            THEN v.sc ELSE l.sc END AS matched_chunk
+                FROM vec v
+                FULL OUTER JOIN lex l ON v.id = l.id
+            )
+            SELECT m.id, m.session_id, m.project, m.role, m.content, m.model,
+                   m.source, m.created_at, f.score + {recency_term} AS score,
+                   f.matched_chunk
+            FROM fused f
+            JOIN messages m ON m.id = f.id
+            {("WHERE " + self_pred) if self_pred else ""}
+            ORDER BY score DESC, m.created_at DESC
             LIMIT {int(sql_limit)}
         """
     else:
@@ -671,6 +986,9 @@ async def search(
         rows = await conn.fetch(sql, *params)
         _t_sql = time.perf_counter() - _t1
         _t_probe = _t1 - _t0 - _t_embed
+        pair_gate_hit = (
+            await pair_uncovered(conn, q, rows)
+            if (abstain and ABSTAIN_ENABLED and PAIR_GATE) else False)
 
     # Abstain BEFORE re-ranking, deliberately. Measured 2026-09-10 on four
     # subjects SQL-verified absent from the index: judging the RRF order
@@ -683,7 +1001,10 @@ async def search(
     # answering, on precisely the queries where it should refuse.
     abstained, abstain_note = False, "off"
     _t_abstain = 0.0
-    if abstain and ABSTAIN_ENABLED:
+    if pair_gate_hit:
+        # Decided without the judge, so this also saves the judge call.
+        abstained, abstain_note = True, "pair gate: no passage mentions both"
+    elif abstain and ABSTAIN_ENABLED:
         _t3 = time.perf_counter()
         abstained, abstain_note = await judge_abstain(
             app.state.http, q, list(rows[:ABSTAIN_ROWS]))
@@ -705,7 +1026,7 @@ async def search(
         "query": q,
         "abstained": abstained,
         "abstain": abstain_note,
-        "mode": "hybrid" if hybrid else "vector",
+        "mode": ("hybrid+chunks" if use_chunks else "hybrid") if hybrid else "vector",
         "lex_query": (params[1] if hybrid else None),
         "rerank": rank_note,
         "timings_ms": {"embed": round(_t_embed*1000), "probe": round(_t_probe*1000),
@@ -723,6 +1044,7 @@ async def search(
                 "model": r["model"],
                 "created_at": r["created_at"].isoformat(),
                 "similarity": round(float(r["score"]), 4),
+                **({"matched_chunk": r["matched_chunk"]} if use_chunks else {}),
             }
             for r in rows
         ],

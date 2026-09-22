@@ -47,6 +47,14 @@ services:
       # would be, measured WORSE than no re-ranker at all. Turn it on with the
       # GPU override (docker-compose.gpu.yml), which also pulls the model.
       ECHOES_RERANK: "0"
+      # Index-time chunk search and the chunk-aware judge (sql/005_chunks.sql).
+      # Off by default; set in the shell to measure, e.g.
+      #   ECHOES_CHUNK_SEARCH=1 docker compose ... up -d server
+      ECHOES_CHUNK_SEARCH: "${ECHOES_CHUNK_SEARCH:-0}"
+      ECHOES_JUDGE_CHUNK: "${ECHOES_JUDGE_CHUNK:-0}"
+      ECHOES_RERANK_CHUNK: "${ECHOES_RERANK_CHUNK:-0}"
+      ECHOES_CHUNK_CAP: "${ECHOES_CHUNK_CAP:-0}"
+      ECHOES_PAIR_GATE: "${ECHOES_PAIR_GATE:-0}"
     depends_on:
       postgres:
         condition: service_healthy
