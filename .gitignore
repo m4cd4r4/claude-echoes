@@ -22,6 +22,7 @@ cache/
 # the variants that existed when it was written, and one stray variant
 # (eval_cases_notemporal.json) was already sitting untracked and unignored.
 benchmarks/eval_*
+benchmarks/bm25_eval_*.json
 benchmarks/graded_*
 benchmarks/plan_*.sql
 benchmarks/judge.log
